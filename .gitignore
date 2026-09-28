@@ -6,3 +6,7 @@ __pycache__/
 .env.*
 *.pem
 *.key
+data/
+demo_voices/
+backend/.pytest_cache/
+frontend/dist/
