@@ -1,0 +1,133 @@
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: #14161c;
+  color: #e6e8ee;
+  font-size: 13px;
+}
+
+.app { display: flex; flex-direction: column; min-height: 100vh; }
+
+.toolbar {
+  background: #1c1f28;
+  border-bottom: 1px solid #2b2f3c;
+  padding: 10px 14px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.toolbar-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.status-row { margin-top: 8px; }
+.app-title { font-size: 15px; margin-right: 6px; }
+.project-meta { color: #8b93a7; font-size: 12px; }
+
+button {
+  background: #2a2f3d;
+  color: #e6e8ee;
+  border: 1px solid #3a4052;
+  border-radius: 5px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-size: 12px;
+}
+button:hover { background: #353b4d; }
+.btn-primary { background: #2f6df0; border-color: #2f6df0; }
+.btn-primary:hover { background: #3f7bff; }
+.btn-danger { background: #c0392b; border-color: #c0392b; }
+
+.master-gain, .force-export, .gain-label { display: flex; align-items: center; gap: 6px; color: #aeb6c8; font-size: 12px; }
+
+.status { color: #9aa3b8; }
+.status-error { color: #ff7676; }
+.over-ranges { color: #ffb06b; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.over-range-chip {
+  background: #3a2a22;
+  border: 1px solid #6b4a30;
+  border-radius: 4px;
+  padding: 1px 7px;
+  font-size: 11px;
+}
+.hint { color: #7e879c; font-size: 12px; margin-top: 6px; }
+
+.timeline { flex: 1; overflow: auto; padding: 0 0 24px; }
+.timeline-inner { min-width: max-content; }
+
+.ruler-spacer { height: 22px; width: 260px; display: inline-block; vertical-align: top; }
+.ruler { position: relative; display: inline-block; height: 22px; border-bottom: 1px solid #2b2f3c; }
+.ruler-tick { position: absolute; top: 0; bottom: 0; border-left: 1px solid #33384a; padding-left: 4px; color: #7e879c; font-size: 10px; }
+
+.track { display: flex; border-bottom: 1px solid #232734; min-height: 92px; }
+.track-muted { opacity: 0.55; }
+.track-dimmed { opacity: 0.4; }
+
+.track-controls {
+  width: 260px;
+  flex: 0 0 260px;
+  background: #191c25;
+  border-right: 1px solid #2b2f3c;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  position: sticky;
+  left: 0;
+  z-index: 5;
+}
+.track-name { background: #232735; border: 1px solid #33384a; color: #e6e8ee; border-radius: 4px; padding: 4px 6px; }
+.track-buttons { display: flex; gap: 6px; }
+.btn-toggle { min-width: 34px; padding: 3px 8px; }
+.active-danger { background: #c0392b; border-color: #c0392b; }
+.active-warn { background: #d68f2c; border-color: #d68f2c; color: #1a1a1a; }
+.gain-label { font-size: 11px; }
+.gain-label input { width: 100%; }
+
+.track-lane { position: relative; min-height: 92px; background-image: linear-gradient(to right, #1f2330 1px, transparent 1px); background-size: 80px 100%; }
+.effects-slot {
+  position: absolute; inset: 4px; border: 1px dashed #2e3445; border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  color: #4d556b; font-size: 11px; pointer-events: none;
+}
+
+.clip {
+  position: absolute; top: 18px; height: 58px;
+  background: linear-gradient(180deg, #2d6cdf, #2456b0);
+  border: 1px solid #5d8fef;
+  border-radius: 6px;
+  display: flex; align-items: stretch;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+.clip:active { cursor: grabbing; }
+.clip-selected { outline: 2px solid #ffd166; }
+.clip-body {
+  flex: 1; padding: 4px 8px; overflow: hidden;
+  display: flex; flex-direction: column; gap: 2px;
+  min-width: 0;
+}
+.clip-label { font-weight: 600; font-size: 11px; white-space: nowrap; }
+.clip-time { font-size: 10px; color: #cfe0ff; white-space: nowrap; }
+.clip-delete {
+  position: absolute; top: -8px; right: -8px;
+  width: 20px; height: 20px; border-radius: 50%;
+  padding: 0; line-height: 18px;
+  background: #c0392b; border-color: #c0392b;
+}
+.clip-handle {
+  width: 8px; flex: 0 0 8px;
+  background: rgba(255,255,255,0.22);
+  cursor: ew-resize;
+}
+.clip-handle-left { border-radius: 6px 0 0 6px; }
+.clip-handle-right { border-radius: 0 6px 6px 0; }
+
+.add-track { margin: 12px 0 0 272px; }
+
+.chain-doc {
+  padding: 10px 16px; color: #737c92; font-size: 11px;
+  border-top: 1px solid #232734; background: #181b23;
+}
+.fatal-error { padding: 10px 16px; background: #4a2020; color: #ffb3b3; }
