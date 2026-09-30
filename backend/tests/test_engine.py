@@ -367,3 +367,135 @@ def test_multi_rate_trim_move_save_chunks(tmp_path):
     sf.write(str(out), np.concatenate(pieces), sr)
     loaded, _ = sf.read(str(out))
     assert np.allclose(loaded, full, atol=2e-4)  # PCM16 量化容差
+
+
+# ---------- 区间渲染与整段渲染统一、效果尾音 ----------
+
+def _impulse(path: str, duration: float = 1.0, sr: int = 44100) -> None:
+    data = np.zeros((int(duration * sr), 1), dtype=np.float32)
+    data[0, 0] = 0.9
+    data[int(0.5 * sr), 0] = 0.6
+    sf.write(path, data, sr, subtype="PCM_16")
+
+
+def _splice_error(project, loader, bounds, sr=44100):
+    """整段渲染 vs 相邻区间拼接的最大逐采样误差。"""
+    full = render(project, loader, start_time=bounds[0], end_time=bounds[-1]).mix
+    pieces = [render(project, loader, start_time=a, end_time=b).mix
+              for a, b in zip(bounds[:-1], bounds[1:])]
+    stitched = np.concatenate(pieces)
+    assert stitched.shape == full.shape
+    return float(np.max(np.abs(stitched - full))), stitched, full
+
+
+def test_ranged_render_with_delay_matches_full_impulse(session):
+    """脉冲 + 延迟：多个相邻区间拼接与整段渲染逐采样一致。"""
+    imp_path = os.path.join(os.path.dirname(session.root), "imp.wav")
+    _impulse(imp_path)
+    imp = session.import_file(imp_path, "imp.wav").relpath
+    track = Track("t1", clips=[Clip("c1", imp, 0.0, 0.0, 1.0)])
+    track.effects = [{"type": "delay", "delay_sec": 0.13,
+                      "feedback": 0.5, "wet": 0.6, "amount": 1.0}]
+    p = session.project
+    p.tracks = [track]
+    # 区间边界故意落在两次脉冲的回声衰减中段。
+    err, stitched, full = _splice_error(p, session.load_source, [0.0, 0.57, 1.03, 1.6])
+    print(f"脉冲：分块拼接 vs 整段 最大误差 = {err:.3e}")
+    assert err < 1e-6
+    # 回声状态没有丢失：0.5s 脉冲（在第二块起点 0.57s 之前）的回声
+    # 落在 0.63s（第二块内），分块渲染必须保留它。
+    at = int(0.63 * 44100)
+    assert np.max(np.abs(stitched[at:at + 200])) > 1e-3
+
+
+def test_ranged_render_with_delay_matches_full_tone(session):
+    """持续音 + 延迟 + 轨道自动化：边界处音量/声像连续，拼接误差可忽略。"""
+    src_a, _ = _sources_by_freq(session)
+    track = Track("t1", clips=[Clip("c1", src_a, 0.0, 0.0, 1.0)])
+    track.effects = [{"type": "delay", "delay_sec": 0.07,
+                      "feedback": 0.4, "wet": 0.5, "amount": 1.0}]
+    # 自动化断点正好跨在分块边界 0.5s 上。
+    track.automation = [AutomationPoint(0.3, gain_db=0.0, pan=-1.0),
+                        AutomationPoint(0.7, gain_db=-12.0, pan=1.0)]
+    p = session.project
+    p.tracks = [track]
+    err, stitched, full = _splice_error(p, session.load_source, [0.0, 0.5, 1.0])
+    print(f"持续音：分块拼接 vs 整段 最大误差 = {err:.3e}")
+    assert err < 1e-6
+    # 边界处逐采样连续：边界前后各 5ms 与整段对应位置一致（已含在 err 内），
+    # 且边界两侧电平确实在变化（自动化跨边界生效）。
+    edge = int(0.5 * 44100)
+    before = np.max(np.abs(full[edge - 220:edge]))
+    after = np.max(np.abs(full[edge:edge + 220]))
+    assert abs(before - after) > 1e-4
+
+
+def test_ranged_render_start_matches_full_slice(session):
+    """从中途单独渲染 = 整段渲染后截取同一段（延迟状态不丢失）。"""
+    src_a, _ = _sources_by_freq(session)
+    track = Track("t1", clips=[Clip("c1", src_a, 0.0, 0.0, 1.0)])
+    track.effects = [{"type": "delay", "delay_sec": 0.11,
+                      "feedback": 0.6, "wet": 0.7, "amount": 1.0}]
+    p = session.project
+    p.tracks = [track]
+    full = render(p, session.load_source, start_time=0.0, end_time=1.0).mix
+    mid = render(p, session.load_source, start_time=0.4, end_time=0.9).mix
+    sliced = full[int(0.4 * 44100):int(0.9 * 44100)]
+    err = float(np.max(np.abs(mid - sliced)))
+    print(f"中途渲染 vs 整段截取 最大误差 = {err:.3e}")
+    assert mid.shape == sliced.shape
+    assert err < 1e-6
+
+
+def test_include_tail_extends_past_content_end(session):
+    """导出所选片段及其自然衰减尾音；区分片段结束与尾音结束。"""
+    src_a, _ = _sources_by_freq(session)
+    track = Track("t1", clips=[Clip("c1", src_a, 0.0, 0.0, 0.3)])
+    track.effects = [{"type": "delay", "delay_sec": 0.1,
+                      "feedback": 0.0, "wet": 0.8, "amount": 1.0}]
+    p = session.project
+    p.tracks = [track]
+    plain = render(p, session.load_source, start_time=0.0, end_time=0.3)
+    tailed = render(p, session.load_source, start_time=0.0, end_time=0.3,
+                    include_tail=True)
+    # 片段本身的结束仍是 0.3s；含尾音的结束延长一个延迟时间到 0.4s。
+    assert tailed.content_end_time == pytest.approx(0.3, abs=1e-6)
+    assert tailed.end_time == pytest.approx(0.4, abs=1e-6)
+    assert tailed.mix.shape[0] == int(0.4 * 44100)
+    # 不带尾音时 0.3s 即截断；带尾音时 0.3~0.4s 仍有回声余音。
+    assert plain.mix.shape[0] == int(0.3 * 44100)
+    assert np.max(np.abs(tailed.mix[int(0.31 * 44100):int(0.39 * 44100)])) > 0.05
+    # 公共部分与整段渲染一致，尾音不是重新叠加的旧效果。
+    full = render(p, session.load_source, start_time=0.0, end_time=0.4).mix
+    assert np.allclose(tailed.mix, full, atol=1e-6)
+
+
+def test_tail_and_ranged_render_idempotent_across_cancel_and_reopen(session):
+    """取消重导、保存重开都不累加旧效果，也不截断仍应存在的余音。"""
+    src_a, _ = _sources_by_freq(session)
+    track = Track("t1", clips=[Clip("c1", src_a, 0.0, 0.0, 0.5)])
+    track.effects = [{"type": "delay", "delay_sec": 0.09,
+                      "feedback": 0.5, "wet": 0.6, "amount": 1.0}]
+    session.project.tracks = [track]
+    calls = {"n": 0}
+
+    def cancel():
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    with pytest.raises(ExportCancelled):
+        render(session.project, session.load_source, end_time=0.5,
+               include_tail=True, should_cancel=cancel)
+    # 取消后重导：结果与从未取消过一致。
+    a = render(session.project, session.load_source, end_time=0.5, include_tail=True).mix
+    b = render(session.project, session.load_source, end_time=0.5, include_tail=True).mix
+    assert np.allclose(a, b, atol=1e-7)
+    # 保存重开后同一区间（含尾音）逐采样一致。
+    session.save()
+    reopened = Session.open(session.root)
+    c = render(reopened.project, reopened.load_source, end_time=0.5, include_tail=True).mix
+    assert np.allclose(a, c, atol=1e-6)
+    # 改变起止位置再改回来，结果不变（不累积状态）。
+    render(reopened.project, reopened.load_source, start_time=0.2, end_time=0.7)
+    d = render(reopened.project, reopened.load_source, end_time=0.5, include_tail=True).mix
+    assert np.allclose(a, d, atol=1e-7)

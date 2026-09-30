@@ -11,6 +11,7 @@ export function Toolbar() {
   const [forceExport, setForceExport] = useState(false);
   const [rangeStart, setRangeStart] = useState("");
   const [rangeEnd, setRangeEnd] = useState("");
+  const [includeTail, setIncludeTail] = useState(false);
   const pollRef = useRef<number | null>(null);
 
   async function importMedia() {
@@ -66,6 +67,7 @@ export function Toolbar() {
       const range = {
         ...(rangeStart.trim() !== "" ? { start_time: Number(rangeStart) } : {}),
         ...(rangeEnd.trim() !== "" ? { end_time: Number(rangeEnd) } : {}),
+        ...(includeTail ? { include_tail: true } : {}),
       };
       const { job_id } = await api.startExport(output, forceExport, range);
       setExportStatus(null);
@@ -76,9 +78,15 @@ export function Toolbar() {
         setExportStatus(status);
         if (status.status !== "running") {
           stopPolling();
-          setMessage(status.status === "done"
-            ? `导出完成：${status.output_path}`
-            : status.status === "cancelled" ? "导出已取消，未生成成品文件" : `导出失败：${status.message}`);
+          if (status.status === "done") {
+            const tailNote = status.end_time != null && status.content_end_time != null
+              && status.end_time > status.content_end_time + 1e-6
+              ? `（片段结束 ${status.content_end_time.toFixed(2)}s，含尾音结束 ${status.end_time.toFixed(2)}s）`
+              : "";
+            setMessage(`导出完成：${status.output_path}${tailNote}`);
+          } else {
+            setMessage(status.status === "cancelled" ? "导出已取消，未生成成品文件" : `导出失败：${status.message}`);
+          }
         }
       }, 250);
     } catch (error) {
@@ -121,6 +129,10 @@ export function Toolbar() {
           <input value={rangeStart} placeholder="0" onChange={(e) => setRangeStart(e.target.value)} />
           止
           <input value={rangeEnd} placeholder="结尾" onChange={(e) => setRangeEnd(e.target.value)} />
+        </label>
+        <label className="force-export">
+          <input type="checkbox" checked={includeTail} onChange={(e) => setIncludeTail(e.target.checked)} />
+          含效果尾音
         </label>
         {running ? (
           <button className="btn-danger" onClick={cancelExport}>取消导出</button>

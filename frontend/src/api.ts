@@ -32,7 +32,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(project),
     }) as Promise<PreviewReport>,
-  startExport: (outputPath: string, allowOverRange: boolean, range?: { start_time?: number; end_time?: number }) =>
+  startExport: (outputPath: string, allowOverRange: boolean, range?: { start_time?: number; end_time?: number; include_tail?: boolean }) =>
     request("/api/export", {
       method: "POST",
       body: JSON.stringify({ output_path: outputPath, allow_over_range: allowOverRange, ...(range ?? {}) }),
@@ -53,5 +53,7 @@ export interface ExportStatus {
   over_range: boolean;
   over_count: number;
   over_ranges: { start: number; end: number }[];
+  content_end_time: number | null;
+  end_time: number | null;
   output_path: string | null;
 }
