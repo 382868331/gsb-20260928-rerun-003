@@ -1,19 +1,27 @@
 """混音引擎：轨道 -> 输出的处理顺序在这里固定下来。
 
 对每条被听见的轨道：
-    源音频 -> 按素材 in/out 裁切 -> 素材增益 -> 轨道效果器链(预留)
-    -> 轨道推子增益 -> 叠加到母线
+    源音频 -> 按素材 in/out 裁切 -> 素材增益与素材内自动化（随素材移动）
+    -> 声像 -> 叠加到轨道缓冲
+轨道缓冲：
+    轨道效果器链（增益/延迟等，强度可被工程绝对时间自动化）
+    -> 轨道推子增益/声像/轨道自动化（留在工程时间上）
+    -> 叠加到母线
 母线：各轨叠加 -> 主控增益 -> 输出范围检测 -> 导出
+
+支持只渲染 [start, end) 区间，用于分块导出；区间渲染是纯计算，
+不会修改工程或素材缓存，因此重复导出不会叠加上一次的效果。
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
 
-from .model import Clip, Project, Track, _db_to_gain
+from .model import AutomationPoint, Clip, Project, Track, _db_to_gain
 
 
 SourceLoader = Callable[[str], np.ndarray]
@@ -38,6 +46,7 @@ class RenderResult:
     over_count: int                 # 超范围采样点数
     over_ranges: list[OverRange] = field(default_factory=list)
     duration: float = 0.0
+    start_time: float = 0.0
 
 
 class RenderError(Exception):
@@ -53,13 +62,87 @@ def _clip_segment(source: np.ndarray, clip: Clip, sr: int) -> np.ndarray:
     return source[first:last]
 
 
-def _apply_effects(track_audio: np.ndarray, track: Track, sr: int) -> np.ndarray:
-    """轨道效果器链位置预留。以后效果器按 effects 列表顺序在此插入。"""
-    for effect in track.effects:
-        raise RenderError(
-            f"效果器 '{effect.get('type', '?')}' 尚未实现；处理位已在轨道 {track.name} 上预留"
-        )
-    return track_audio
+def _envelope(
+    points: Sequence[AutomationPoint],
+    key: str,
+    times: np.ndarray,
+    default: float,
+) -> np.ndarray:
+    """按断点线性插值出逐采样参数；区间外保持端点值，无断点时为默认值。"""
+    values = [(p.time, getattr(p, key)) for p in points if getattr(p, key) is not None]
+    if not values:
+        return np.full(times.shape[0], default, dtype=np.float64)
+    pt = np.array([v[0] for v in values], dtype=np.float64)
+    pv = np.array([v[1] for v in values], dtype=np.float64)
+    return np.interp(times, pt, pv, left=pv[0], right=pv[-1]).astype(np.float64)
+
+
+def _db_to_gain_array(db: np.ndarray) -> np.ndarray:
+    return np.power(10.0, db / 20.0)
+
+
+def _pan_gains(pan: np.ndarray | float) -> tuple[np.ndarray | float, np.ndarray | float]:
+    """线性恒功率近似声像：-1 全左、0 居中、1 全右。"""
+    left = np.clip(1.0 - pan, 0.0, 1.0) * (1.0 / np.sqrt(2.0))
+    right = np.clip(1.0 + pan, 0.0, 1.0) * (1.0 / np.sqrt(2.0))
+    return left, right
+
+
+def _apply_pan(audio: np.ndarray, pan_env: np.ndarray | float) -> np.ndarray:
+    """把（可能单声道的）音频按逐采样声像摆位成立体声 [帧, 2]。"""
+    if audio.shape[1] == 1:
+        mono = audio[:, 0]
+        left_g, right_g = _pan_gains(pan_env)
+        return np.stack([mono * left_g, mono * right_g], axis=1)
+    # 立体声素材：按声像在两声道间平衡（不改变自身宽度感）。
+    left_g, right_g = _pan_gains(pan_env)
+    out = audio.copy()
+    out[:, 0] *= left_g
+    out[:, 1] *= right_g
+    return out
+
+
+def _run_effect(
+    audio: np.ndarray, effect: dict, sr: int, amount_env: np.ndarray | float,
+) -> np.ndarray:
+    """执行单个效果器。amount_env 为逐采样处理强度（0=干声，1=全效果）。"""
+    kind = effect.get("type")
+    amount = float(effect.get("amount", 1.0))
+    wet_env = np.clip(amount_env * amount, 0.0, 1.0)
+
+    if kind == "gain":
+        gain_db = float(effect.get("gain_db", 0.0))
+        scale = np.power(10.0, gain_db * wet_env / 20.0)
+        return audio * scale[:, None]
+
+    if kind in ("delay", "echo"):
+        delay_sec = max(0.0, float(effect.get("delay_sec", 0.25)))
+        feedback = min(0.9, max(0.0, float(effect.get("feedback", 0.3))))
+        wet_level = min(1.0, max(0.0, float(effect.get("wet", 0.4))))
+        frames = audio.shape[0]
+        delay = int(round(delay_sec * sr))
+        # 有限抽头近似；延迟时间为 0 或超出缓冲时不加回声。
+        if delay <= 0 or delay >= frames:
+            return audio
+        wet = np.zeros_like(audio)
+        scale = 1.0
+        tap_delay = delay
+        taps = max(1, int(np.ceil(np.log(max(1e-4, 1.0 - feedback + 1e-9)) /
+                                  np.log(max(feedback, 1e-9))))) if feedback > 0 else 1
+        taps = min(taps, 32)
+        for _ in range(taps):
+            if tap_delay >= frames:
+                break
+            wet[tap_delay:] += audio[:frames - tap_delay] * scale * wet_level
+            scale *= feedback
+            tap_delay += delay
+        if isinstance(wet_env, np.ndarray) and wet_env.ndim == 1:
+            wet = wet * wet_env[:, None]
+        else:
+            wet = wet * float(wet_env)
+        return audio + wet
+
+    raise RenderError(f"未知效果器类型: {kind!r}")
 
 
 def _over_ranges(flag: np.ndarray, sr: int, max_gap_samples: int = 64) -> tuple[list[OverRange], int]:
@@ -87,16 +170,27 @@ def render(
     project: Project,
     load_source: SourceLoader,
     duration: float | None = None,
+    start_time: float = 0.0,
+    end_time: float | None = None,
     should_cancel: CancelFn | None = None,
 ) -> RenderResult:
+    """渲染工程（或其 [start_time, end_time) 区间），返回混合结果。
+
+    本函数对输入工程与素材缓存都是只读的：重复调用结果相同，
+    不会把上一次渲染的效果叠加进来。
+    """
     sr = project.sample_rate
     channels = project.channels
 
-    # 先确定总长度（由时间线最末端素材决定，可外部指定）。
+    # 先确定渲染区间。默认渲染整段（长度由所有素材决定，含静音/未独听轨）。
     timeline_end = project.timeline_length()
-    if duration is None:
-        duration = timeline_end
-    total_frames = int(round(duration * sr))
+    if end_time is None:
+        end_time = timeline_end if duration is None else start_time + duration
+    start_time = max(0.0, float(start_time))
+    end_time = max(start_time, float(end_time))
+    start_frame = int(round(start_time * sr))
+    total_frames = int(round(end_time * sr)) - start_frame
+    total_frames = max(0, total_frames)
     bus = np.zeros((total_frames, channels), dtype=np.float64)
 
     cache: dict[str, np.ndarray] = {}
@@ -104,39 +198,75 @@ def render(
     def get_source(key: str) -> np.ndarray:
         if key not in cache:
             data = load_source(key)
-            if data.ndim != 2 or data.shape[1] != channels:
+            if data.ndim != 2:
                 raise RenderError(f"素材 {key} 未统一到工程格式")
             cache[key] = data
         return cache[key]
 
     for track in project.active_tracks():
-        track_gain = _db_to_gain(track.gain_db)
-        for clip in track.clips:
-            if should_cancel and should_cancel():
-                from .audio import ExportCancelled
-                raise ExportCancelled()
-            source = get_source(clip.source)
-            segment = _clip_segment(source, clip, sr)
-            if clip.gain_db:
-                segment = segment * _db_to_gain(clip.gain_db)
-            # 轨道效果器链（预留位置，目前为空链）。
-            segment = _apply_effects(segment, track, sr)
-            segment = segment * track_gain
+        if should_cancel and should_cancel():
+            from .audio import ExportCancelled
+            raise ExportCancelled()
 
-            start_frame = int(round(clip.start * sr))
-            end_frame = start_frame + segment.shape[0]
-            if end_frame <= 0 or start_frame >= total_frames:
+        # 先把整条轨道在渲染区间内的素材混合成轨道缓冲（立体声）。
+        track_bus = np.zeros((total_frames, 2), dtype=np.float64)
+        for clip in track.clips:
+            source = get_source(clip.source)  # 可能是单声道或立体声缓存
+            segment = _clip_segment(source, clip, sr)
+            clip_first = int(round(clip.start * sr))
+            clip_last = clip_first + segment.shape[0]
+            if clip_last <= start_frame or clip_first >= start_frame + total_frames:
                 continue
-            src_start = max(0, -start_frame)
-            dst_start = max(0, start_frame)
-            dst_end = min(total_frames, end_frame)
-            bus[dst_start:dst_end] += segment[src_start:src_start + (dst_end - dst_start)]
+            local_first = max(clip_first, start_frame) - start_frame
+            local_last = min(clip_last, start_frame + total_frames) - start_frame
+            src_first = max(clip_first, start_frame) - clip_first
+            part = segment[src_first:src_first + (local_last - local_first)].astype(np.float64)
+
+            frames_n = local_last - local_first
+            local_times = (np.arange(frames_n) + start_frame + local_first) / sr
+            rel_times = local_times - clip.start
+            # 素材内自动化：时间相对素材起点，移动素材时断点一起移动。
+            gain_env = _db_to_gain_array(_envelope(clip.automation, "gain_db", rel_times, 0.0))
+            pan_env = _envelope(clip.automation, "pan", rel_times, 0.0)
+            part = part * (gain_env[:, None] * _db_to_gain(clip.gain_db))
+            # 素材声像自动化时才在素材级摆位；否则保持原声道，声像交给轨道级统一处理。
+            if part.shape[1] == 1:
+                part = np.repeat(part, 2, axis=1)
+            if any(p.pan is not None for p in clip.automation):
+                part = _apply_pan(part, pan_env)
+            track_bus[local_first:local_last] += part
+
+        if should_cancel and should_cancel():
+            from .audio import ExportCancelled
+            raise ExportCancelled()
+
+        # 轨道效果器链：强度可被工程绝对时间自动化（不随素材移动）。
+        abs_times = (np.arange(total_frames) + start_frame) / sr
+        amount_env = _envelope(track.automation, "amount", abs_times, 1.0)
+        for effect in track.effects:
+            # amount 自动化对整条链统一生效（无断点时效果器用自身 amount）。
+            track_bus = _run_effect(track_bus, effect, sr, amount_env)
+
+        # 轨道推子与轨道级自动化：绝对工程时间，素材移动不影响它们。
+        track_gain_env = _db_to_gain_array(
+            _envelope(track.automation, "gain_db", abs_times, track.gain_db)
+        )
+        track_pan_env = _envelope(track.automation, "pan", abs_times, track.pan)
+        track_bus = _apply_pan(track_bus, track_pan_env) * track_gain_env[:, None]
+        if channels == 1:
+            # 工程为单声道时，把摆位后的立体声等比例混合回单声道。
+            bus[:, 0] += track_bus.mean(axis=1)
+        else:
+            bus[:, :] += track_bus
 
     peak_before_master = float(np.max(np.abs(bus))) if bus.size else 0.0
 
     # 叠加超出输出范围（满刻度 1.0）时必须明确提示：在主控推子前检测。
     over_flags = np.max(np.abs(bus), axis=1) > 1.0
     ranges, over_count = _over_ranges(over_flags, sr)
+    for item in ranges:
+        item.start += start_time
+        item.end += start_time
 
     master = bus * project.master_gain()
     peak = float(np.max(np.abs(master))) if master.size else 0.0
@@ -151,4 +281,5 @@ def render(
         over_count=over_count,
         over_ranges=ranges,
         duration=total_frames / sr,
+        start_time=start_frame / sr,
     )

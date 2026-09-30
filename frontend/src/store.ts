@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { ClipData, ProjectData, TrackData } from "./types";
+import type { AutomationPointData, ClipData, EffectData, ProjectData, TrackData } from "./types";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
@@ -33,6 +33,13 @@ interface StudioState {
   trimClip: (trackId: string, clipId: string, patch: TrimPatch) => void;
   trimClipLive: (trackId: string, clipId: string, patch: LiveTrimPatch) => void;
   setClipGain: (trackId: string, clipId: string, gainDb: number) => void;
+  setClipFades: (trackId: string, clipId: string, fadeIn: number, fadeOut: number) => void;
+  setClipAutomation: (trackId: string, clipId: string, points: AutomationPointData[]) => void;
+  setTrackPan: (trackId: string, pan: number) => void;
+  setTrackAutomation: (trackId: string, points: AutomationPointData[]) => void;
+  addEffect: (trackId: string, effect: EffectData) => void;
+  updateEffect: (trackId: string, index: number, patch: Partial<EffectData>) => void;
+  removeEffect: (trackId: string, index: number) => void;
   removeClip: (trackId: string, clipId: string) => void;
   rememberMedia: (source: string, duration: number) => void;
 }
@@ -42,7 +49,12 @@ function mutateTrack(project: ProjectData, trackId: string, fn: (track: TrackDat
     ...project,
     tracks: project.tracks.map((track) => {
       if (track.id !== trackId) return track;
-      const next: TrackData = { ...track, clips: track.clips.map((clip) => ({ ...clip })) };
+      const next: TrackData = {
+        ...track,
+        clips: track.clips.map((clip) => ({ ...clip, automation: [...clip.automation] })),
+        effects: track.effects.map((effect) => ({ ...effect })),
+        automation: [...track.automation],
+      };
       fn(next);
       return next;
     }),
@@ -83,7 +95,9 @@ export const useStudio = create<StudioState>((set) => ({
             muted: false,
             solo: false,
             gain_db: 0,
+            pan: 0,
             effects: [],
+            automation: [],
             clips: [],
           },
         ],
@@ -120,6 +134,7 @@ export const useStudio = create<StudioState>((set) => ({
         in_point: 0,
         out_point: duration,
         gain_db: 0,
+        automation: [],
       };
       const project = mutateTrack(state.project, trackId, (t) => t.clips.push({ ...clip }));
       return { project, selected: { trackId, clipId: clip.id } };
@@ -174,6 +189,61 @@ export const useStudio = create<StudioState>((set) => ({
       project: withClip(state, trackId, clipId, (clip) => {
         clip.gain_db = gainDb;
       }),
+    })),
+
+  setClipFades: (trackId, clipId, fadeIn, fadeOut) =>
+    set((state) => ({
+      project: withClip(state, trackId, clipId, (clip) => {
+        const duration = clip.out_point - clip.in_point;
+        const points = clip.automation.filter((p) => p.time !== 0 && Math.abs(p.time - duration) > 1e-9);
+        const next: AutomationPointData[] = [...points];
+        if (fadeIn > 0) {
+          next.push({ time: 0, gain_db: -120 });
+          next.push({ time: Math.min(fadeIn, duration), gain_db: 0 });
+        }
+        if (fadeOut > 0) {
+          next.push({ time: Math.max(0, duration - fadeOut), gain_db: 0 });
+          next.push({ time: duration, gain_db: -120 });
+        }
+        next.sort((a, b) => a.time - b.time);
+        clip.automation = next;
+      }),
+    })),
+
+  setClipAutomation: (trackId, clipId, points) =>
+    set((state) => ({
+      project: withClip(state, trackId, clipId, (clip) => {
+        clip.automation = [...points].sort((a, b) => a.time - b.time);
+      }),
+    })),
+
+  setTrackPan: (trackId, pan) =>
+    set((state) => ({
+      project: mutateTrack(state.project, trackId, (t) => { t.pan = Math.max(-1, Math.min(1, pan)); }),
+    })),
+
+  setTrackAutomation: (trackId, points) =>
+    set((state) => ({
+      project: mutateTrack(state.project, trackId, (t) => {
+        t.automation = [...points].sort((a, b) => a.time - b.time);
+      }),
+    })),
+
+  addEffect: (trackId, effect) =>
+    set((state) => ({
+      project: mutateTrack(state.project, trackId, (t) => { t.effects.push({ amount: 1, ...effect }); }),
+    })),
+
+  updateEffect: (trackId, index, patch) =>
+    set((state) => ({
+      project: mutateTrack(state.project, trackId, (t) => {
+        t.effects[index] = { ...t.effects[index], ...patch };
+      }),
+    })),
+
+  removeEffect: (trackId, index) =>
+    set((state) => ({
+      project: mutateTrack(state.project, trackId, (t) => { t.effects.splice(index, 1); }),
     })),
 
   removeClip: (trackId, clipId) =>

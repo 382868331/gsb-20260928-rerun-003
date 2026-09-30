@@ -124,6 +124,64 @@ button:hover { background: #353b4d; }
 .clip-handle-left { border-radius: 6px 0 0 6px; }
 .clip-handle-right { border-radius: 0 6px 6px 0; }
 
+.clip-automation {
+  position: absolute;
+  inset: 18px 6px 4px 6px;
+  pointer-events: auto;
+  border-radius: 4px;
+}
+.clip-automation:hover { background: rgba(255, 255, 255, 0.06); }
+.clip-auto-svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.auto-line { stroke-width: 3; vector-effect: non-scaling-stroke; }
+.auto-gain { stroke: #ffd166; }
+.auto-pan { stroke: #8ecae6; }
+
+.workspace { display: flex; align-items: flex-start; gap: 12px; }
+.inspector {
+  width: 340px;
+  min-width: 340px;
+  max-height: 70vh;
+  overflow-y: auto;
+  background: #1b2436;
+  border: 1px solid #30405f;
+  border-radius: 10px;
+  padding: 12px;
+  margin: 8px 12px;
+}
+.inspector h3 { margin: 0 0 8px; font-size: 14px; }
+.inspector h4 { margin: 12px 0 6px; font-size: 12px; color: #9db4d8; }
+.inspector .field { display: block; font-size: 11px; color: #cfe0ff; margin: 6px 0; }
+.inspector .field input { width: 100%; }
+.fade-row { display: flex; gap: 6px; align-items: end; font-size: 11px; }
+.fade-row input { width: 64px; }
+.points-toolbar, .effects-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; color: #9db4d8; margin-top: 10px; gap: 6px;
+}
+.points-head, .points-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr 24px;
+  gap: 4px;
+  font-size: 10px;
+  align-items: center;
+}
+.points-head { color: #7f93b5; margin-top: 4px; }
+.points-row { margin-top: 4px; grid-template-columns: 1fr 1fr 1fr 1fr 24px; }
+.points-row input { width: 100%; padding: 2px; font-size: 10px; }
+.points-empty { font-size: 11px; color: #637596; padding: 4px 0; }
+.effect-card {
+  border: 1px solid #30405f;
+  border-radius: 8px;
+  padding: 6px 8px;
+  margin-top: 6px;
+  background: #16203280;
+}
+.effect-title { display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
+.effect-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; font-size: 10px; }
+.effect-grid input { width: 100%; padding: 2px; }
+.range-field { font-size: 12px; display: inline-flex; align-items: center; gap: 4px; }
+.range-field input { width: 56px; padding: 2px 4px; }
+
 .add-track { margin: 12px 0 0 272px; }
 
 .chain-doc {

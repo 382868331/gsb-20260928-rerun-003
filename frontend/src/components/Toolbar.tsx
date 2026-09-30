@@ -9,6 +9,8 @@ export function Toolbar() {
   const [preview, setPreview] = useState<PreviewReport | null>(null);
   const [exportStatus, setExportStatus] = useState<ExportStatus | null>(null);
   const [forceExport, setForceExport] = useState(false);
+  const [rangeStart, setRangeStart] = useState("");
+  const [rangeEnd, setRangeEnd] = useState("");
   const pollRef = useRef<number | null>(null);
 
   async function importMedia() {
@@ -61,7 +63,11 @@ export function Toolbar() {
     if (!output) return;
     try {
       await api.saveProject(useStudio.getState().project);
-      const { job_id } = await api.startExport(output, forceExport);
+      const range = {
+        ...(rangeStart.trim() !== "" ? { start_time: Number(rangeStart) } : {}),
+        ...(rangeEnd.trim() !== "" ? { end_time: Number(rangeEnd) } : {}),
+      };
+      const { job_id } = await api.startExport(output, forceExport, range);
       setExportStatus(null);
       setMessage("导出中……可随时取消，取消不会留下文件");
       stopPolling();
@@ -109,6 +115,12 @@ export function Toolbar() {
         <label className="force-export">
           <input type="checkbox" checked={forceExport} onChange={(e) => setForceExport(e.target.checked)} />
           超范围仍导出
+        </label>
+        <label className="range-field">
+          分块导出 起
+          <input value={rangeStart} placeholder="0" onChange={(e) => setRangeStart(e.target.value)} />
+          止
+          <input value={rangeEnd} placeholder="结尾" onChange={(e) => setRangeEnd(e.target.value)} />
         </label>
         {running ? (
           <button className="btn-danger" onClick={cancelExport}>取消导出</button>

@@ -10,18 +10,44 @@ interface Props {
   onTrimLive: (patch: { inPoint?: number; outPoint?: number }) => void;
   onTrimCommit: (patch: { in_point?: number; out_point?: number; start?: number }) => void;
   onRemove: () => void;
+  onAutomation: (points: ClipData["automation"]) => void;
 }
 
 type DragMode = "move" | "left" | "right";
 
 export function ClipView({
-  clip, pixelsPerSecond, selected, onSelect, onMoveCommit, onTrimLive, onTrimCommit, onRemove,
+  clip, pixelsPerSecond, selected, onSelect, onMoveCommit, onTrimLive, onTrimCommit, onRemove, onAutomation,
 }: Props) {
   const drag = useRef<{ mode: DragMode; x: number; start: number; inPoint: number; outPoint: number; target: HTMLElement } | null>(null);
 
   const duration = clip.out_point - clip.in_point;
   const left = clip.start * pixelsPerSecond;
   const width = Math.max(24, duration * pixelsPerSecond);
+
+  function handleLaneDoubleClick(event: React.MouseEvent) {
+    event.stopPropagation();
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const rel = Math.max(0, Math.min(duration, (event.clientX - rect.left) / pixelsPerSecond));
+    const vertical = 1 - Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+    const gainDb = Math.round((-24 + vertical * 24) * 10) / 10;
+    const pan = event.shiftKey ? Math.round((vertical * 2 - 1) * 100) / 100 : null;
+    const points = [...clip.automation];
+    const existing = points.findIndex((p) => Math.abs(p.time - rel) < 0.02);
+    const point = { time: Number(rel.toFixed(3)), gain_db: pan === null ? gainDb : null, pan };
+    if (existing >= 0) points[existing] = point; else points.push(point);
+    points.sort((a, b) => a.time - b.time);
+    onAutomation(points);
+  }
+
+  const polyPoints = (key: "gain_db" | "pan") => {
+    const pts = clip.automation.filter((p) => p[key] !== null && p[key] !== undefined);
+    if (pts.length === 0) return "";
+    const toY = (value: number) => key === "gain_db"
+      ? (1 - (Math.max(-24, Math.min(0, value)) + 24) / 24) * 100
+      : (1 - ((value + 1) / 2)) * 100;
+    const sorted = [...pts].sort((a, b) => a.time - b.time);
+    return sorted.map((p) => `${(p.time / duration) * 100},${toY((p[key] as number))}`).join(" ");
+  };
 
   function begin(mode: DragMode, event: React.PointerEvent) {
     event.stopPropagation();
@@ -83,6 +109,22 @@ export function ClipView({
           >
             ×
           </button>
+        )}
+      </div>
+      <div
+        className="clip-automation"
+        onDoubleClick={handleLaneDoubleClick}
+        title="双击添加音量断点（Shift+双击添加声像断点）"
+      >
+        {polyPoints("gain_db") && (
+          <svg className="clip-auto-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
+            <polyline points={polyPoints("gain_db")} className="auto-line auto-gain" fill="none" />
+          </svg>
+        )}
+        {polyPoints("pan") && (
+          <svg className="clip-auto-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
+            <polyline points={polyPoints("pan")} className="auto-line auto-pan" fill="none" />
+          </svg>
         )}
       </div>
       <div className="clip-handle clip-handle-right" onPointerDown={(e) => begin("right", e)} />

@@ -18,6 +18,66 @@ def _db_to_gain(db: float) -> float:
 
 
 @dataclass
+class AutomationPoint:
+    """一个自动化断点。
+
+    时间含义由所属列表决定：
+      - 素材（clip）上：相对素材起点的时间（秒），随素材一起移动；
+      - 轨道（track）上：工程绝对时间（秒），素材移动不会改变它。
+
+    各数值字段都是可选的：None 表示该断点不自动化此参数
+    （相邻断点之间按线性插值，超出端点范围时保持端点值）。
+
+    gain_db: 音量（分贝），素材与轨道自动化均可使用。
+    pan:     声像，-1（全左）.. 0（中）.. 1（全右）。
+    amount:  轨道效果处理强度 0..1（湿声/效果比例）。
+    """
+
+    time: float
+    gain_db: float | None = None
+    pan: float | None = None
+    amount: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"time": round(self.time, 6)}
+        if self.gain_db is not None:
+            data["gain_db"] = self.gain_db
+        if self.pan is not None:
+            data["pan"] = self.pan
+        if self.amount is not None:
+            data["amount"] = self.amount
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AutomationPoint":
+        def maybe_float(key: str) -> float | None:
+            value = data.get(key)
+            return None if value is None else float(value)
+
+        point = cls(
+            time=float(data["time"]),
+            gain_db=maybe_float("gain_db"),
+            pan=maybe_float("pan"),
+            amount=maybe_float("amount"),
+        )
+        if point.pan is not None:
+            point.pan = min(1.0, max(-1.0, point.pan))
+        if point.amount is not None:
+            point.amount = min(1.0, max(0.0, point.amount))
+        return point
+
+
+def _automation_to_dict(points: list[AutomationPoint]) -> list[dict[str, Any]]:
+    return [p.to_dict() for p in points]
+
+
+def _automation_from_dict(data: Any) -> list[AutomationPoint]:
+    points = [AutomationPoint.from_dict(item) for item in (data or [])]
+    points.sort(key=lambda p: p.time)
+    return points
+
+
+@dataclass
 class Clip:
     """时间线上的一段素材（对源文件的非破坏引用）。
 
@@ -33,6 +93,11 @@ class Clip:
     in_point: float = 0.0
     out_point: float = 0.0
     gain_db: float = 0.0
+    # 注意：新增字段一律放在 gain_db 之后，保持旧位置参数顺序兼容。
+
+    # 素材内部的自动化：时间相对素材起点（随素材移动）。
+    # 例如起点 -inf dB、稍后 0 dB 即素材淡入；也可以放任意多段音量/声像断点。
+    automation: list[AutomationPoint] = field(default_factory=list)
 
     @property
     def duration(self) -> float:
@@ -56,6 +121,24 @@ class Clip:
             self.in_point = min(self.in_point, float(source_duration))
             self.out_point = min(self.out_point, float(source_duration))
 
+    def set_fades(self, fade_in: float = 0.0, fade_out: float = 0.0) -> None:
+        """便捷地在素材首尾安排淡入/淡出（单位秒，相对素材起点）。
+
+        只调整首尾两个音量断点，不影响中间已有的分段音量/声像断点。
+        """
+        fade_in = max(0.0, float(fade_in))
+        fade_out = max(0.0, float(fade_out))
+        self.automation = [p for p in self.automation if p.time not in (0.0, self.duration)]
+        points: list[AutomationPoint] = []
+        if fade_in > 0:
+            points.append(AutomationPoint(0.0, gain_db=-120.0))
+            points.append(AutomationPoint(min(fade_in, self.duration), gain_db=0.0))
+        if fade_out > 0:
+            points.append(AutomationPoint(max(0.0, self.duration - fade_out), gain_db=0.0))
+            points.append(AutomationPoint(self.duration, gain_db=-120.0))
+        self.automation.extend(points)
+        self.automation.sort(key=lambda p: p.time)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -64,6 +147,7 @@ class Clip:
             "in_point": round(self.in_point, 6),
             "out_point": round(self.out_point, 6),
             "gain_db": self.gain_db,
+            "automation": _automation_to_dict(self.automation),
         }
 
     @classmethod
@@ -75,6 +159,7 @@ class Clip:
             in_point=float(data.get("in_point", 0.0)),
             out_point=float(data.get("out_point", 0.0)),
             gain_db=float(data.get("gain_db", 0.0)),
+            automation=_automation_from_dict(data.get("automation", [])),
         )
         if clip.out_point < clip.in_point:
             raise ValueError(f"素材 {clip.id} 的 out_point 早于 in_point")
@@ -83,7 +168,11 @@ class Clip:
 
 @dataclass
 class Track:
-    """一条轨道：素材列表 + 静音/独听 + 推子增益 + 预留效果器链。"""
+    """一条轨道：素材列表 + 静音/独听 + 推子增益/声像 + 效果器链。
+
+    automation 使用工程绝对时间：移动素材不会影响这些断点，
+    因此可以让整条轨道在指定时刻改变音量/声像/效果处理强度。
+    """
 
     id: str
     name: str = "轨道"
@@ -91,8 +180,11 @@ class Track:
     muted: bool = False
     solo: bool = False
     gain_db: float = 0.0
-    # 效果器以后再加：这里先固定处理顺序的位置（参数化效果器节点列表）。
+    pan: float = 0.0
+    # 参数化效果器节点列表，渲染时按顺序执行（见 engine._run_effect）。
     effects: list[dict[str, Any]] = field(default_factory=list)
+    # 轨道级自动化：工程绝对时间（不随素材移动）。
+    automation: list[AutomationPoint] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -101,21 +193,29 @@ class Track:
             "muted": self.muted,
             "solo": self.solo,
             "gain_db": self.gain_db,
+            "pan": self.pan,
             "effects": list(self.effects),
+            "automation": _automation_to_dict(self.automation),
             "clips": [c.to_dict() for c in self.clips],
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Track":
-        return cls(
+        track = cls(
             id=str(data["id"]),
             name=str(data.get("name", "轨道")),
             clips=[Clip.from_dict(c) for c in data.get("clips", [])],
             muted=bool(data.get("muted", False)),
             solo=bool(data.get("solo", False)),
             gain_db=float(data.get("gain_db", 0.0)),
+            pan=min(1.0, max(-1.0, float(data.get("pan", 0.0)))),
             effects=list(data.get("effects", [])),
+            automation=_automation_from_dict(data.get("automation", [])),
         )
+        for effect in track.effects:
+            if not isinstance(effect, dict) or "type" not in effect:
+                raise ValueError("效果器节点必须是带 type 的对象")
+        return track
 
 
 @dataclass
@@ -167,8 +267,13 @@ class Project:
         ]
 
     def timeline_length(self) -> float:
+        """工程时间长度由所有素材决定。
+
+        独听/静音只改变能否听见，绝不缩短导出长度或改变其他轨时间位置，
+        因此这里遍历全部轨道（含静音、未独听的轨道）。
+        """
         end = 0.0
-        for track in self.active_tracks():
+        for track in self.tracks:
             for clip in track.clips:
                 end = max(end, clip.end)
         return end

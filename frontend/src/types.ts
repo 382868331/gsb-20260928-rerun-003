@@ -5,11 +5,24 @@ export interface ClipData {
   in_point: number;
   out_point: number;
   gain_db: number;
+  automation: AutomationPointData[];
 }
 
 export interface EffectData {
-  type: string;
+  type: "gain" | "delay" | string;
+  gain_db?: number;
+  delay_sec?: number;
+  feedback?: number;
+  wet?: number;
+  amount?: number;
   [key: string]: unknown;
+}
+
+export interface AutomationPointData {
+  time: number;
+  gain_db?: number | null;
+  pan?: number | null;
+  amount?: number | null;
 }
 
 export interface TrackData {
@@ -18,7 +31,9 @@ export interface TrackData {
   muted: boolean;
   solo: boolean;
   gain_db: number;
+  pan: number;
   effects: EffectData[];
+  automation: AutomationPointData[];
   clips: ClipData[];
 }
 

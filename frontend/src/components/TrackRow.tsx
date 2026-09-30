@@ -12,7 +12,7 @@ interface Props {
 export function TrackRow({ track, pixelsPerSecond, timelineWidth, anySolo }: Props) {
   const {
     selected, select, toggleMute, toggleSolo, setTrackGain, removeTrack,
-    moveClip, trimClipLive, trimClip, removeClip,
+    moveClip, trimClipLive, trimClip, removeClip, setClipAutomation,
   } = useStudio();
 
   return (
@@ -52,7 +52,9 @@ export function TrackRow({ track, pixelsPerSecond, timelineWidth, anySolo }: Pro
         </label>
       </div>
       <div className="track-lane" style={{ width: timelineWidth }}>
-        <div className="effects-slot">效果器链（预留：{track.effects.length} 个节点）</div>
+        <div className="effects-slot">
+          效果器 {track.effects.length} 个 · 轨道自动化 {track.automation.length} 点 · 声像 {track.pan.toFixed(2)}
+        </div>
         {track.clips.map((clip) => (
           <ClipView
             key={clip.id}
@@ -64,6 +66,7 @@ export function TrackRow({ track, pixelsPerSecond, timelineWidth, anySolo }: Pro
             onTrimLive={(patch) => trimClipLive(track.id, clip.id, patch)}
             onTrimCommit={(patch) => trimClip(track.id, clip.id, patch)}
             onRemove={() => removeClip(track.id, clip.id)}
+            onAutomation={(points) => setClipAutomation(track.id, clip.id, points)}
           />
         ))}
       </div>

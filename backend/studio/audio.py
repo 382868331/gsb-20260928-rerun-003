@@ -94,6 +94,7 @@ def write_wav_atomic(
     subtype: str = "PCM_16",
     should_cancel: CancelFn | None = None,
     progress: Callable[[float], None] | None = None,
+    block_seconds: float = 1.0,
 ) -> None:
     """原子写入 WAV：先写同目录临时文件，成功后再替换到目标路径。
 
@@ -108,7 +109,7 @@ def write_wav_atomic(
             raise ExportCancelled()
 
         # 分块写入以便取消与进度回调。
-        block = max(1, sample_rate)  # 约 1 秒一块
+        block = max(1, int(round(sample_rate * max(0.01, block_seconds))))  # 分块写入
         frames = data.shape[0]
         with sf.SoundFile(tmp_path, mode="w", samplerate=sample_rate,
                           channels=data.shape[1], subtype=subtype,
