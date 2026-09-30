@@ -1,3 +1,8 @@
+export interface AutomationPointData {
+  time: number;
+  value: number;
+}
+
 export interface ClipData {
   id: string;
   source: string;
@@ -5,10 +10,18 @@ export interface ClipData {
   in_point: number;
   out_point: number;
   gain_db: number;
+  volume_points: AutomationPointData[];
+  pan_points: AutomationPointData[];
 }
 
 export interface EffectData {
   type: string;
+  gain_db?: number;
+  time?: number;
+  feedback?: number;
+  mix?: number;
+  cutoff_hz?: number;
+  amount_points?: AutomationPointData[];
   [key: string]: unknown;
 }
 
@@ -19,6 +32,8 @@ export interface TrackData {
   solo: boolean;
   gain_db: number;
   effects: EffectData[];
+  volume_points: AutomationPointData[];
+  pan_points: AutomationPointData[];
   clips: ClipData[];
 }
 

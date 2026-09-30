@@ -18,6 +18,39 @@ def _db_to_gain(db: float) -> float:
 
 
 @dataclass
+class AutomationPoint:
+    """自动化控制点。素材点使用片段内相对时间，轨道点使用工程时间。"""
+
+    time: float
+    value: float
+
+    def to_dict(self) -> dict[str, float]:
+        return {"time": round(self.time, 6), "value": self.value}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AutomationPoint":
+        point = cls(time=float(data["time"]), value=float(data["value"]))
+        if point.time < 0.0:
+            raise ValueError("自动化时间不能为负")
+        return point
+
+
+def _points_to_dict(points: list[AutomationPoint]) -> list[dict[str, float]]:
+    return [point.to_dict() for point in sorted(points, key=lambda item: item.time)]
+
+
+def _points_from_dict(data: Any) -> list[AutomationPoint]:
+    points = [AutomationPoint.from_dict(item) for item in (data or [])]
+    return sorted(points, key=lambda item: item.time)
+
+
+def _validate_pan(points: list[AutomationPoint], label: str) -> None:
+    for point in points:
+        if not -1.0 <= point.value <= 1.0:
+            raise ValueError(f"{label}声像必须在 -1 到 1 之间")
+
+
+@dataclass
 class Clip:
     """时间线上的一段素材（对源文件的非破坏引用）。
 
@@ -33,6 +66,8 @@ class Clip:
     in_point: float = 0.0
     out_point: float = 0.0
     gain_db: float = 0.0
+    volume_points: list[AutomationPoint] = field(default_factory=list)
+    pan_points: list[AutomationPoint] = field(default_factory=list)
 
     @property
     def duration(self) -> float:
@@ -64,6 +99,8 @@ class Clip:
             "in_point": round(self.in_point, 6),
             "out_point": round(self.out_point, 6),
             "gain_db": self.gain_db,
+            "volume_points": _points_to_dict(self.volume_points),
+            "pan_points": _points_to_dict(self.pan_points),
         }
 
     @classmethod
@@ -75,9 +112,12 @@ class Clip:
             in_point=float(data.get("in_point", 0.0)),
             out_point=float(data.get("out_point", 0.0)),
             gain_db=float(data.get("gain_db", 0.0)),
+            volume_points=_points_from_dict(data.get("volume_points", [])),
+            pan_points=_points_from_dict(data.get("pan_points", [])),
         )
         if clip.out_point < clip.in_point:
             raise ValueError(f"素材 {clip.id} 的 out_point 早于 in_point")
+        _validate_pan(clip.pan_points, f"素材 {clip.id} 的")
         return clip
 
 
@@ -91,8 +131,9 @@ class Track:
     muted: bool = False
     solo: bool = False
     gain_db: float = 0.0
-    # 效果器以后再加：这里先固定处理顺序的位置（参数化效果器节点列表）。
     effects: list[dict[str, Any]] = field(default_factory=list)
+    volume_points: list[AutomationPoint] = field(default_factory=list)
+    pan_points: list[AutomationPoint] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -102,12 +143,14 @@ class Track:
             "solo": self.solo,
             "gain_db": self.gain_db,
             "effects": list(self.effects),
+            "volume_points": _points_to_dict(self.volume_points),
+            "pan_points": _points_to_dict(self.pan_points),
             "clips": [c.to_dict() for c in self.clips],
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Track":
-        return cls(
+        track = cls(
             id=str(data["id"]),
             name=str(data.get("name", "轨道")),
             clips=[Clip.from_dict(c) for c in data.get("clips", [])],
@@ -115,7 +158,11 @@ class Track:
             solo=bool(data.get("solo", False)),
             gain_db=float(data.get("gain_db", 0.0)),
             effects=list(data.get("effects", [])),
+            volume_points=_points_from_dict(data.get("volume_points", [])),
+            pan_points=_points_from_dict(data.get("pan_points", [])),
         )
+        _validate_pan(track.pan_points, f"轨道 {track.id} 的")
+        return track
 
 
 @dataclass
@@ -127,7 +174,7 @@ class Project:
     channels: int = 2
     master_gain_db: float = 0.0
     tracks: list[Track] = field(default_factory=list)
-    version: int = 1
+    version: int = 2
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -168,7 +215,8 @@ class Project:
 
     def timeline_length(self) -> float:
         end = 0.0
-        for track in self.active_tracks():
+        # 静音/独听只改变听见哪些轨道，不改变时间线边界与导出长度。
+        for track in self.tracks:
             for clip in track.clips:
                 end = max(end, clip.end)
         return end

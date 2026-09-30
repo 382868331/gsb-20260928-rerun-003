@@ -83,6 +83,10 @@ button:hover { background: #353b4d; }
 .active-warn { background: #d68f2c; border-color: #d68f2c; color: #1a1a1a; }
 .gain-label { font-size: 11px; }
 .gain-label input { width: 100%; }
+.automation-controls { display: flex; gap: 4px; flex-wrap: wrap; }
+.automation-controls button, .effect-line button, .clip-actions button { padding: 2px 6px; font-size: 10px; }
+.automation-summary { color: #8b93a7; font-size: 10px; display: flex; flex-direction: column; gap: 2px; }
+.effect-line { display: flex; align-items: center; justify-content: space-between; gap: 4px; }
 
 .track-lane { position: relative; min-height: 92px; background-image: linear-gradient(to right, #1f2330 1px, transparent 1px); background-size: 80px 100%; }
 .effects-slot {
@@ -110,6 +114,8 @@ button:hover { background: #353b4d; }
 }
 .clip-label { font-weight: 600; font-size: 11px; white-space: nowrap; }
 .clip-time { font-size: 10px; color: #cfe0ff; white-space: nowrap; }
+.clip-auto { font-size: 10px; color: #b7cdf8; white-space: nowrap; }
+.clip-actions { position: absolute; top: -9px; right: -6px; display: flex; gap: 3px; }
 .clip-delete {
   position: absolute; top: -8px; right: -8px;
   width: 20px; height: 20px; border-radius: 50%;

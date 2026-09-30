@@ -9,13 +9,16 @@ interface Props {
   onMoveCommit: (start: number) => void;
   onTrimLive: (patch: { inPoint?: number; outPoint?: number }) => void;
   onTrimCommit: (patch: { in_point?: number; out_point?: number; start?: number }) => void;
+  onFade: (kind: "in" | "out") => void;
+  onAddPoint: (kind: "volume" | "pan") => void;
+  onClearAutomation: () => void;
   onRemove: () => void;
 }
 
 type DragMode = "move" | "left" | "right";
 
 export function ClipView({
-  clip, pixelsPerSecond, selected, onSelect, onMoveCommit, onTrimLive, onTrimCommit, onRemove,
+  clip, pixelsPerSecond, selected, onSelect, onMoveCommit, onTrimLive, onTrimCommit, onFade, onAddPoint, onClearAutomation, onRemove,
 }: Props) {
   const drag = useRef<{ mode: DragMode; x: number; start: number; inPoint: number; outPoint: number; target: HTMLElement } | null>(null);
 
@@ -74,15 +77,18 @@ export function ClipView({
       <div className="clip-body">
         <span className="clip-label">{clip.source.split(".")[0]}</span>
         <span className="clip-time">{clip.in_point.toFixed(2)}s–{clip.out_point.toFixed(2)}s</span>
+        <span className="clip-auto">
+          音量点 {clip.volume_points.length} · 声像点 {clip.pan_points.length}
+        </span>
         {selected && (
-          <button
-            className="clip-delete"
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => { e.stopPropagation(); onRemove(); }}
-            title="从时间线移除（源文件保留）"
-          >
-            ×
-          </button>
+          <div className="clip-actions" onPointerDown={(e) => e.stopPropagation()}>
+            <button onClick={(e) => { e.stopPropagation(); onFade("in"); }}>淡入</button>
+            <button onClick={(e) => { e.stopPropagation(); onFade("out"); }}>淡出</button>
+            <button onClick={(e) => { e.stopPropagation(); onAddPoint("volume"); }}>量点</button>
+            <button onClick={(e) => { e.stopPropagation(); onAddPoint("pan"); }}>像点</button>
+            <button onClick={(e) => { e.stopPropagation(); onClearAutomation(); }}>清</button>
+            <button onClick={(e) => { e.stopPropagation(); onRemove(); }} title="从时间线移除（源文件保留）">×</button>
+          </div>
         )}
       </div>
       <div className="clip-handle clip-handle-right" onPointerDown={(e) => begin("right", e)} />
