@@ -11,6 +11,11 @@
 
 支持只渲染 [start, end) 区间，用于分块导出；区间渲染是纯计算，
 不会修改工程或素材缓存，因此重复导出不会叠加上一次的效果。
+
+区间渲染与整段渲染的含义统一：延迟/回声类效果器在区间起点之前
+的状态通过"预卷"（从起点向前多渲染一段效果尾长再裁掉）保留，
+因此把整段切成若干相邻区间分别渲染再拼接，与整段渲染逐采样一致；
+音量/声像自动化按工程绝对时间逐采样插值，区间边界处取值连续。
 """
 
 from __future__ import annotations
@@ -47,10 +52,42 @@ class RenderResult:
     over_ranges: list[OverRange] = field(default_factory=list)
     duration: float = 0.0
     start_time: float = 0.0
+    # 内容（片段/所选区间）本身的结束时间，与效果尾音的结束时间区分开。
+    content_end_time: float = 0.0   # 请求区间的结束（片段本身到这里为止）
+    tail_end_time: float = 0.0      # 实际渲染结束（含自然衰减尾音）
 
 
 class RenderError(Exception):
     pass
+
+
+def _effect_tail_seconds(effect: dict) -> float:
+    """单个效果器把声音往后拖多长（秒）。增益类为 0。"""
+    kind = effect.get("type")
+    if kind in ("delay", "echo"):
+        delay_sec = max(0.0, float(effect.get("delay_sec", 0.25)))
+        feedback = min(0.9, max(0.0, float(effect.get("feedback", 0.3))))
+        if delay_sec <= 0:
+            return 0.0
+        if feedback > 0:
+            taps = int(np.ceil(np.log(max(1e-4, 1.0 - feedback + 1e-9)) /
+                               np.log(max(feedback, 1e-9))))
+            taps = min(max(taps, 1), 32)
+        else:
+            taps = 1
+        return delay_sec * taps
+    if kind == "gain":
+        return 0.0
+    raise RenderError(f"未知效果器类型: {kind!r}")
+
+
+def effect_tail_seconds(project: Project) -> float:
+    """整条效果器链的自然衰减尾长（各效果器尾长相加），取所有轨道的最大值。"""
+    tail = 0.0
+    for track in project.tracks:
+        track_tail = sum(_effect_tail_seconds(e) for e in track.effects)
+        tail = max(tail, track_tail)
+    return tail
 
 
 def _clip_segment(source: np.ndarray, clip: Clip, sr: int) -> np.ndarray:
@@ -172,12 +209,17 @@ def render(
     duration: float | None = None,
     start_time: float = 0.0,
     end_time: float | None = None,
+    include_tail: bool = False,
     should_cancel: CancelFn | None = None,
 ) -> RenderResult:
     """渲染工程（或其 [start_time, end_time) 区间），返回混合结果。
 
     本函数对输入工程与素材缓存都是只读的：重复调用结果相同，
     不会把上一次渲染的效果叠加进来。
+
+    include_tail=True 时在 end_time 之后继续渲染效果器的自然衰减尾音，
+    此时 content_end_time 是所选区间本身的结束，tail_end_time 是尾音
+    真正衰减完的结束；两者相等表示没有尾音或未请求尾音。
     """
     sr = project.sample_rate
     channels = project.channels
@@ -188,9 +230,21 @@ def render(
         end_time = timeline_end if duration is None else start_time + duration
     start_time = max(0.0, float(start_time))
     end_time = max(start_time, float(end_time))
+    content_end_time = end_time
+    tail = effect_tail_seconds(project)
+    if include_tail:
+        # 允许导出所选片段及其自然衰减的尾音：区间结束不等于声音结束。
+        end_time = end_time + tail
     start_frame = int(round(start_time * sr))
     total_frames = int(round(end_time * sr)) - start_frame
     total_frames = max(0, total_frames)
+
+    # 预卷：效果器（如延迟/回声）在区间起点之前就有状态。从起点向前
+    # 多渲染一个尾长再裁掉，使分段渲染与整段渲染在衔接处逐采样一致，
+    # 分段起点不会丢失前面的效果状态。
+    pre_frames = min(start_frame, int(round(tail * sr))) if start_frame > 0 else 0
+    render_start_frame = start_frame - pre_frames
+    render_frames = total_frames + pre_frames
     bus = np.zeros((total_frames, channels), dtype=np.float64)
 
     cache: dict[str, np.ndarray] = {}
@@ -208,22 +262,22 @@ def render(
             from .audio import ExportCancelled
             raise ExportCancelled()
 
-        # 先把整条轨道在渲染区间内的素材混合成轨道缓冲（立体声）。
-        track_bus = np.zeros((total_frames, 2), dtype=np.float64)
+        # 先把整条轨道在（含预卷的）渲染区间内的素材混合成轨道缓冲（立体声）。
+        track_bus = np.zeros((render_frames, 2), dtype=np.float64)
         for clip in track.clips:
             source = get_source(clip.source)  # 可能是单声道或立体声缓存
             segment = _clip_segment(source, clip, sr)
             clip_first = int(round(clip.start * sr))
             clip_last = clip_first + segment.shape[0]
-            if clip_last <= start_frame or clip_first >= start_frame + total_frames:
+            if clip_last <= render_start_frame or clip_first >= render_start_frame + render_frames:
                 continue
-            local_first = max(clip_first, start_frame) - start_frame
-            local_last = min(clip_last, start_frame + total_frames) - start_frame
-            src_first = max(clip_first, start_frame) - clip_first
+            local_first = max(clip_first, render_start_frame) - render_start_frame
+            local_last = min(clip_last, render_start_frame + render_frames) - render_start_frame
+            src_first = max(clip_first, render_start_frame) - clip_first
             part = segment[src_first:src_first + (local_last - local_first)].astype(np.float64)
 
             frames_n = local_last - local_first
-            local_times = (np.arange(frames_n) + start_frame + local_first) / sr
+            local_times = (np.arange(frames_n) + render_start_frame + local_first) / sr
             rel_times = local_times - clip.start
             # 素材内自动化：时间相对素材起点，移动素材时断点一起移动。
             gain_env = _db_to_gain_array(_envelope(clip.automation, "gain_db", rel_times, 0.0))
@@ -241,13 +295,19 @@ def render(
             raise ExportCancelled()
 
         # 轨道效果器链：强度可被工程绝对时间自动化（不随素材移动）。
-        abs_times = (np.arange(total_frames) + start_frame) / sr
+        # 效果器在含预卷的缓冲上执行，状态从区间起点之前延续过来。
+        abs_times = (np.arange(render_frames) + render_start_frame) / sr
         amount_env = _envelope(track.automation, "amount", abs_times, 1.0)
         for effect in track.effects:
             # amount 自动化对整条链统一生效（无断点时效果器用自身 amount）。
             track_bus = _run_effect(track_bus, effect, sr, amount_env)
 
+        # 裁掉预卷部分：效果状态已延续进区间，预卷声音本身不输出。
+        track_bus = track_bus[pre_frames:]
+
         # 轨道推子与轨道级自动化：绝对工程时间，素材移动不影响它们。
+        # 逐采样按绝对时间插值，区间边界处取值与整段渲染完全一致。
+        abs_times = (np.arange(total_frames) + start_frame) / sr
         track_gain_env = _db_to_gain_array(
             _envelope(track.automation, "gain_db", abs_times, track.gain_db)
         )
@@ -282,4 +342,6 @@ def render(
         over_ranges=ranges,
         duration=total_frames / sr,
         start_time=start_frame / sr,
+        content_end_time=content_end_time,
+        tail_end_time=start_frame / sr + total_frames / sr,
     )

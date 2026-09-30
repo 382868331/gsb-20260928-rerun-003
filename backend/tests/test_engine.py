@@ -367,3 +367,140 @@ def test_multi_rate_trim_move_save_chunks(tmp_path):
     sf.write(str(out), np.concatenate(pieces), sr)
     loaded, _ = sf.read(str(out))
     assert np.allclose(loaded, full, atol=2e-4)  # PCM16 量化容差
+
+
+def _impulse(path: str, duration: float, sr: int = 44100) -> None:
+    sig = np.zeros(int(duration * sr), dtype=np.float32)
+    sig[0] = 0.8
+    sf.write(path, sig[:, None], sr, subtype="PCM_16")
+
+
+def _delay_track(track_id, clips, **kw):
+    effect = {"type": "delay", "delay_sec": 0.3, "feedback": 0.6, "wet": 0.8, "amount": 1.0}
+    return Track(track_id, clips=clips, effects=[effect], **kw)
+
+
+def _report_overlap(name, full, chunks, bounds, sr):
+    """比较整段渲染与相邻分块在重叠边界处的数值误差并打印报告。"""
+    joined = np.concatenate(chunks)
+    assert joined.shape == full.shape
+    max_err = float(np.max(np.abs(joined - full)))
+    print(f"\n[{name}] 拼接 vs 整段: max|err| = {max_err:.3e}")
+    for b in bounds[1:-1]:
+        frame = int(round(b * sr))
+        lo, hi = max(0, frame - 64), min(full.shape[0], frame + 64)
+        err = float(np.max(np.abs(joined[lo:hi] - full[lo:hi])))
+        print(f"  边界 {b:.3f}s 附近 64 采样窗内 max|err| = {err:.3e}")
+    return max_err
+
+
+def test_chunked_render_matches_full_with_delay_impulse(tmp_path):
+    """脉冲 + 延迟/回声：整段渲染与多个相邻区间拼接逐采样一致。"""
+    sr = 44100
+    sess = Session.create(str(tmp_path / "s4"), sample_rate=sr)
+    _impulse(str(tmp_path / "imp.wav"), 0.05, sr=sr)
+    src = sess.import_file(str(tmp_path / "imp.wav"), "imp.wav").relpath
+    clip = Clip("c", src, start=0.5, in_point=0.0, out_point=0.05)
+    sess.project.tracks = [_delay_track("t", [clip])]
+
+    full = render(sess.project, sess.load_source, include_tail=True).mix
+    end = full.shape[0] / sr
+    bounds = [0.0, 0.5, 0.9, end]
+    chunks = [
+        render(sess.project, sess.load_source, start_time=a, end_time=b).mix
+        for a, b in zip(bounds[:-1], bounds[1:])
+    ]
+    max_err = _report_overlap("脉冲+回声", full, chunks, bounds, sr)
+    assert max_err < 1e-6
+    # 回声确实跨越了分块边界（否则比较没有意义）。
+    assert np.max(np.abs(full[int(0.9 * sr):])) > 1e-3
+
+
+def test_chunked_render_matches_full_with_delay_tone(tmp_path):
+    """持续音 + 延迟 + 轨道音量/声像自动化：边界处连续且拼接一致。"""
+    sr = 44100
+    sess = Session.create(str(tmp_path / "s5"), sample_rate=sr)
+    _tone(str(tmp_path / "tone.wav"), 440, 3.0, sr=sr)
+    src = sess.import_file(str(tmp_path / "tone.wav"), "tone.wav").relpath
+    clip = Clip("c", src, start=0.0, in_point=0.0, out_point=3.0)
+    track = _delay_track("t", [clip])
+    # 自动化断点横跨分块边界 1.0s / 2.0s，边界两侧斜率不同。
+    track.automation = [
+        AutomationPoint(0.5, gain_db=-12.0, pan=-1.0),
+        AutomationPoint(1.5, gain_db=0.0, pan=1.0),
+        AutomationPoint(2.5, gain_db=-6.0, pan=0.0),
+    ]
+    sess.project.tracks = [track]
+
+    full = render(sess.project, sess.load_source).mix
+    bounds = [0.0, 1.0, 2.0, 3.0]
+    chunks = [
+        render(sess.project, sess.load_source, start_time=a, end_time=b).mix
+        for a, b in zip(bounds[:-1], bounds[1:])
+    ]
+    max_err = _report_overlap("持续音+回声+自动化", full, chunks, bounds, sr)
+    assert max_err < 1e-6
+    # 边界处自动化取值连续：相邻两块在边界帧上的取值与整段渲染一致。
+    for b in (1.0, 2.0):
+        frame = int(round(b * sr))
+        before = chunks[int(b) - 1]  # 在 b 结束的块
+        after = chunks[int(b)]       # 从 b 开始的块
+        assert np.allclose(before[-1], full[frame - 1], atol=1e-6)
+        assert np.allclose(after[0], full[frame], atol=1e-6)
+
+
+def test_include_tail_extends_past_content_end(tmp_path):
+    """导出所选片段及其自然衰减尾音：片段结束与尾音结束明确区分。"""
+    sr = 44100
+    sess = Session.create(str(tmp_path / "s6"), sample_rate=sr)
+    _impulse(str(tmp_path / "imp.wav"), 0.05, sr=sr)
+    src = sess.import_file(str(tmp_path / "imp.wav"), "imp.wav").relpath
+    clip = Clip("c", src, start=1.0, in_point=0.0, out_point=0.05)
+    sess.project.tracks = [_delay_track("t", [clip])]
+
+    plain = render(sess.project, sess.load_source, start_time=0.5, end_time=1.5)
+    assert plain.content_end_time == pytest.approx(1.5)
+    assert plain.tail_end_time == pytest.approx(1.5)
+
+    tailed = render(sess.project, sess.load_source,
+                    start_time=0.5, end_time=1.5, include_tail=True)
+    assert tailed.content_end_time == pytest.approx(1.5)   # 片段本身到这里结束
+    assert tailed.tail_end_time > 1.5 + 0.5                # 尾音继续衰减
+    # 尾音里确实还有声音（回声在片段结束之后仍可听见）。
+    tail_frames = tailed.mix[int((1.5 - 0.5) * sr):]
+    assert np.max(np.abs(tail_frames)) > 1e-3
+    # 内容区间部分与不带尾音的渲染一致。
+    assert np.allclose(tailed.mix[:plain.mix.shape[0]], plain.mix, atol=1e-6)
+
+
+def test_repeated_and_cancelled_exports_do_not_accumulate(tmp_path):
+    """改变起止、反复取消重导、保存重开：不累加旧效果、不截断余音。"""
+    sr = 44100
+    sess = Session.create(str(tmp_path / "s7"), sample_rate=sr)
+    _impulse(str(tmp_path / "imp.wav"), 0.05, sr=sr)
+    src = sess.import_file(str(tmp_path / "imp.wav"), "imp.wav").relpath
+    clip = Clip("c", src, start=0.2, in_point=0.0, out_point=0.05)
+    sess.project.tracks = [_delay_track("t", [clip])]
+
+    first = render(sess.project, sess.load_source, include_tail=True).mix
+    # 取消一次渲染后再渲染，结果不变。
+    calls = {"n": 0}
+
+    def cancel():
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    with pytest.raises(ExportCancelled):
+        render(sess.project, sess.load_source, include_tail=True, should_cancel=cancel)
+    second = render(sess.project, sess.load_source, include_tail=True).mix
+    assert np.allclose(first, second, atol=0.0)  # 逐采样完全相同
+    # 改变起止区间再渲染整段，仍一致。
+    render(sess.project, sess.load_source, start_time=0.6, end_time=1.1)
+    third = render(sess.project, sess.load_source, include_tail=True).mix
+    assert np.allclose(first, third, atol=0.0)
+    # 保存重开后余音不被截断、效果不叠加。
+    sess.save()
+    reopened = Session.open(sess.root)
+    fourth = render(reopened.project, reopened.load_source, include_tail=True).mix
+    assert fourth.shape == first.shape
+    assert np.allclose(first, fourth, atol=1e-6)

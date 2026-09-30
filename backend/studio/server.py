@@ -53,19 +53,21 @@ class StudioState:
 
     def start_export(self, output_path: str, subtype: str,
                      start_time: float | None = None,
-                     end_time: float | None = None) -> ExportJob:
+                     end_time: float | None = None,
+                     include_tail: bool = False) -> ExportJob:
         job = ExportJob(uuid.uuid4().hex[:12], os.path.abspath(output_path))
         with self.lock:
             self.jobs[job.id] = job
         thread = threading.Thread(
             target=self._run_export,
-            args=(job, subtype, start_time, end_time), daemon=True,
+            args=(job, subtype, start_time, end_time, include_tail), daemon=True,
         )
         thread.start()
         return job
 
     def _run_export(self, job: ExportJob, subtype: str,
-                    start_time: float | None, end_time: float | None) -> None:
+                    start_time: float | None, end_time: float | None,
+                    include_tail: bool) -> None:
         try:
             with self.lock:
                 session = self.session
@@ -76,6 +78,7 @@ class StudioState:
                 project, session.load_source,
                 start_time=0.0 if start_time is None else start_time,
                 end_time=end_time,
+                include_tail=include_tail,
                 should_cancel=job.cancelled,
             )
             job.peak = result.peak
@@ -245,11 +248,13 @@ def make_handler(state: StudioState):
             end_time = data.get("end_time")
             start_time = None if start_time is None else float(start_time)
             end_time = None if end_time is None else float(end_time)
+            include_tail = bool(data.get("include_tail", False))
             if not data.get("allow_over_range", False):
                 with state.lock:
                     snapshot = Project.from_dict(state.session.project.to_dict())
                     loader = state.session.load_source
-                result = render(snapshot, loader, start_time=start_time or 0.0, end_time=end_time)
+                result = render(snapshot, loader, start_time=start_time or 0.0,
+                                end_time=end_time, include_tail=include_tail)
                 if result.over_range:
                     self._send_json({
                         "over_range": True,
@@ -262,7 +267,7 @@ def make_handler(state: StudioState):
                     }, status=409)
                     return
             subtype = data.get("subtype", "PCM_16")
-            job = state.start_export(output, subtype, start_time, end_time)
+            job = state.start_export(output, subtype, start_time, end_time, include_tail)
             self._send_json({"job_id": job.id, "output_path": job.output_path})
 
         def _export_status(self, job_id: str) -> None:

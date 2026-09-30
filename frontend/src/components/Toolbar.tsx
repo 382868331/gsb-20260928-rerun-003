@@ -9,6 +9,7 @@ export function Toolbar() {
   const [preview, setPreview] = useState<PreviewReport | null>(null);
   const [exportStatus, setExportStatus] = useState<ExportStatus | null>(null);
   const [forceExport, setForceExport] = useState(false);
+  const [includeTail, setIncludeTail] = useState(false);
   const [rangeStart, setRangeStart] = useState("");
   const [rangeEnd, setRangeEnd] = useState("");
   const pollRef = useRef<number | null>(null);
@@ -66,6 +67,7 @@ export function Toolbar() {
       const range = {
         ...(rangeStart.trim() !== "" ? { start_time: Number(rangeStart) } : {}),
         ...(rangeEnd.trim() !== "" ? { end_time: Number(rangeEnd) } : {}),
+        ...(includeTail ? { include_tail: true } : {}),
       };
       const { job_id } = await api.startExport(output, forceExport, range);
       setExportStatus(null);
@@ -121,6 +123,10 @@ export function Toolbar() {
           <input value={rangeStart} placeholder="0" onChange={(e) => setRangeStart(e.target.value)} />
           止
           <input value={rangeEnd} placeholder="结尾" onChange={(e) => setRangeEnd(e.target.value)} />
+        </label>
+        <label className="force-export">
+          <input type="checkbox" checked={includeTail} onChange={(e) => setIncludeTail(e.target.checked)} />
+          含效果尾音
         </label>
         {running ? (
           <button className="btn-danger" onClick={cancelExport}>取消导出</button>
