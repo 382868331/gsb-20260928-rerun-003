@@ -14,9 +14,12 @@ export function TrackRow({ track, pixelsPerSecond, timelineWidth, anySolo }: Pro
     selected, select, toggleMute, toggleSolo, setTrackGain, removeTrack,
     moveClip, trimClipLive, trimClip, removeClip, setClipAutomation,
   } = useStudio();
+  const ducking = useStudio((state) => state.project.ducking);
+  const isControl = ducking?.control_track_id === track.id;
+  const isDuckTarget = ducking?.target_track_ids.includes(track.id) ?? false;
 
   return (
-    <div className={`track ${track.muted ? "track-muted" : ""} ${anySolo && !track.solo ? "track-dimmed" : ""}`}>
+    <div className={`track ${track.muted ? "track-muted" : ""} ${anySolo && !track.solo ? "track-dimmed" : ""} ${isControl ? "track-control" : ""} ${isDuckTarget ? "track-duck-target" : ""}`}>
       <div className="track-controls">
         <input
           className="track-name"
@@ -55,6 +58,12 @@ export function TrackRow({ track, pixelsPerSecond, timelineWidth, anySolo }: Pro
         <div className="effects-slot">
           效果器 {track.effects.length} 个 · 轨道自动化 {track.automation.length} 点 · 声像 {track.pan.toFixed(2)}
         </div>
+        {(isControl || isDuckTarget) && (
+          <div className="duck-badges">
+            {isControl && <span className="badge-control">控制轨</span>}
+            {isDuckTarget && <span className="badge-target">背景音乐</span>}
+          </div>
+        )}
         {track.clips.map((clip) => (
           <ClipView
             key={clip.id}

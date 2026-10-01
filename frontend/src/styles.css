@@ -52,6 +52,38 @@ button:hover { background: #353b4d; }
 }
 .hint { color: #7e879c; font-size: 12px; margin-top: 6px; }
 
+.ducking-panel {
+  margin: 10px 14px 0;
+  padding: 10px 12px;
+  border: 1px solid #34405a;
+  border-radius: 10px;
+  background: #182033;
+}
+.ducking-title { display: flex; flex-direction: column; gap: 3px; margin-bottom: 8px; }
+.ducking-title span { color: #8b99b5; font-size: 11px; }
+.ducking-grid { display: grid; grid-template-columns: 220px 1fr 280px; gap: 12px; align-items: start; }
+.ducking-panel label { display: flex; flex-direction: column; gap: 4px; color: #aebbd5; font-size: 11px; }
+.ducking-panel select, .ducking-panel input[type="number"] {
+  background: #232735; color: #e6e8ee; border: 1px solid #33384a; border-radius: 4px; padding: 4px 6px;
+}
+.duck-targets { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; color: #aebbd5; font-size: 11px; }
+.duck-targets label { display: inline-flex; flex-direction: row; align-items: center; gap: 3px; }
+.duck-modes { display: flex; gap: 8px; }
+.duck-modes label { flex-direction: row; align-items: center; gap: 3px; background: #20283a; border: 1px solid #303a52; border-radius: 6px; padding: 5px; }
+.duck-modes .duck-mode-active { border-color: #6d95e8; background: #263655; }
+.duck-modes button { padding: 2px 7px; font-size: 10px; }
+.ducking-params { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 10px; }
+.ducking-params input[type="range"] { width: 100%; }
+.duck-note, .duck-message { margin-top: 8px; color: #ffd166; font-size: 11px; }
+.duck-compare { display: flex; gap: 8px; margin-top: 10px; }
+.duck-report { display: flex; flex-direction: column; gap: 2px; padding: 6px 10px; border-radius: 6px; background: #20283a; min-width: 110px; font-size: 11px; }
+.duck-report-bad { border: 1px solid #c0392b; color: #ff8a80; }
+.duck-ranges, .duck-danger { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; margin-top: 6px; font-size: 10px; color: #9fc3ff; }
+.duck-danger { color: #ff9b7a; }
+.duck-ranges span:not(:first-child), .duck-danger span:not(:first-child) {
+  background: #26304a; border: 1px solid #3b4d74; border-radius: 4px; padding: 1px 5px;
+}
+
 .timeline { flex: 1; overflow: auto; padding: 0 0 24px; }
 .timeline-inner { min-width: max-content; }
 
@@ -62,6 +94,8 @@ button:hover { background: #353b4d; }
 .track { display: flex; border-bottom: 1px solid #232734; min-height: 92px; }
 .track-muted { opacity: 0.55; }
 .track-dimmed { opacity: 0.4; }
+.track-control { box-shadow: inset 4px 0 0 #d68f2c; }
+.track-duck-target { box-shadow: inset 4px 0 0 #47b881; }
 
 .track-controls {
   width: 260px;
@@ -90,6 +124,10 @@ button:hover { background: #353b4d; }
   display: flex; align-items: center; justify-content: center;
   color: #4d556b; font-size: 11px; pointer-events: none;
 }
+.duck-badges { position: absolute; top: 6px; right: 8px; display: flex; gap: 5px; z-index: 2; }
+.duck-badges span { border-radius: 4px; padding: 1px 6px; font-size: 10px; }
+.badge-control { background: #6b4a1c; color: #ffd166; }
+.badge-target { background: #1f513c; color: #82e0aa; }
 
 .clip {
   position: absolute; top: 18px; height: 58px;

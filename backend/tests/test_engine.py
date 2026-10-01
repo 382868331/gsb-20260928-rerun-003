@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from studio.audio import ExportCancelled, write_wav_atomic
 from studio.engine import render
-from studio.model import AutomationPoint, Clip, Project, Track
+from studio.model import AutomationPoint, Clip, Project, Track, default_ducking
 from studio.store import Session
 
 
@@ -504,3 +504,154 @@ def test_repeated_and_cancelled_exports_do_not_accumulate(tmp_path):
     fourth = render(reopened.project, reopened.load_source, include_tail=True).mix
     assert fourth.shape == first.shape
     assert np.allclose(first, fourth, atol=1e-6)
+
+
+def _write_monotone(path: str, values: np.ndarray, sr: int = 44100) -> None:
+    sf.write(path, values.astype(np.float32)[:, None], sr, subtype="PCM_16")
+
+
+def _ducking_project(sess: Session, tmp_path, *, control_values: np.ndarray,
+                     preset_id: str = "a", muted_control: bool = False,
+                     clips=None, music_duration: float = 1.0) -> Project:
+    sr = sess.project.sample_rate
+    _write_monotone(str(tmp_path / "music.wav"), np.full(int(music_duration * sr), 0.4), sr)
+    _write_monotone(str(tmp_path / "voice.wav"), control_values, sr)
+    music_src = sess.import_file(str(tmp_path / "music.wav"), "music.wav").relpath
+    voice_src = sess.import_file(str(tmp_path / "voice.wav"), "voice.wav").relpath
+    if clips is None:
+        clips = [Clip("voice", voice_src, 0.0, 0.0, len(control_values) / sr)]
+    config = default_ducking()
+    config.update({
+        "control_track_id": "voice",
+        "target_track_ids": ["music"],
+        "active_preset_id": preset_id,
+    })
+    config["presets"][0].update(
+        threshold_db=-20.0, depth_db=-12.0, attack_sec=0.01,
+        hold_sec=0.10, release_sec=0.20,
+    )
+    project = sess.project
+    project.ducking = config
+    project.tracks = [
+        Track("music", "音乐", clips=[Clip("music", music_src, 0.0, 0.0, music_duration)]),
+        Track("voice", "主持", muted=muted_control, clips=clips if clips is not None else [
+            Clip("voice", voice_src, 0.0, 0.0, len(control_values) / sr)
+        ]),
+    ]
+    return project
+
+
+def test_ducking_short_pulse_holds_releases_and_reports_ranges(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "duck-pulse"), sample_rate=sr)
+    voice = np.zeros(sr, dtype=np.float32)
+    voice[int(0.2 * sr):int(0.22 * sr)] = 0.8
+    project = _ducking_project(sess, tmp_path, control_values=voice, muted_control=True)
+
+    result = render(project, sess.load_source)
+    assert result.duration == pytest.approx(1.3, abs=2e-3)  # 尾部包含保持+恢复
+    assert result.ducking_ranges
+    first = result.ducking_ranges[0]
+    assert first.start == pytest.approx(0.2, abs=2e-3)
+    assert first.end == pytest.approx(0.5, abs=3e-2)
+    # 短脉冲也能立刻压到约 -12 dB；保持期未恢复，0.5s 后恢复完成。
+    assert np.max(np.abs(result.mix[int(0.215 * sr):int(0.29 * sr)])) == pytest.approx(0.071, abs=0.015)
+    assert np.min(result.mix[int(0.52 * sr):int(0.60 * sr), 0]) == pytest.approx(0.283, abs=0.01)
+
+
+def test_muted_control_track_still_ducks_but_is_silent(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "duck-muted"), sample_rate=sr)
+    voice = np.zeros(sr, dtype=np.float32)
+    voice[int(0.2 * sr):int(0.4 * sr)] = 0.8
+    project = _ducking_project(sess, tmp_path, control_values=voice, muted_control=True)
+
+    result = render(project, sess.load_source)
+    window = result.mix[int(0.25 * sr):int(0.35 * sr), 0]
+    assert np.max(np.abs(window)) == pytest.approx(0.071, abs=0.015)
+    assert result.ducking_ranges
+
+
+def test_adjacent_control_clips_keep_ducking_without_gap(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "duck-adjacent"), sample_rate=sr)
+    _write_monotone(str(tmp_path / "music.wav"), np.full(sr, 0.4), sr)
+    voice_a = np.zeros(int(0.3 * sr), dtype=np.float32)
+    voice_b = np.zeros(int(0.3 * sr), dtype=np.float32)
+    voice_a[int(0.2 * sr):] = 0.8
+    voice_b[:int(0.1 * sr)] = 0.8
+    _write_monotone(str(tmp_path / "a.wav"), voice_a, sr)
+    _write_monotone(str(tmp_path / "b.wav"), voice_b, sr)
+    music_src = sess.import_file(str(tmp_path / "music.wav"), "music.wav").relpath
+    voice_a_src = sess.import_file(str(tmp_path / "a.wav"), "a.wav").relpath
+    voice_b_src = sess.import_file(str(tmp_path / "b.wav"), "b.wav").relpath
+    config = default_ducking()
+    config.update(control_track_id="voice", target_track_ids=["music"], active_preset_id="a")
+    config["presets"][0].update(
+        threshold_db=-20.0, depth_db=-12.0, attack_sec=0.01,
+        hold_sec=0.05, release_sec=0.20,
+    )
+    sess.project.ducking = config
+    sess.project.tracks = [
+        Track("music", clips=[Clip("music", music_src, 0, 0, 1.0)]),
+        Track("voice", muted=True, clips=[
+            Clip("va", voice_a_src, 0, 0, 0.3),
+            Clip("vb", voice_b_src, 0.3, 0, 0.3),
+        ]),
+    ]
+    result = render(sess.project, sess.load_source)
+    # 两个片段在 0.3s 相接，中间不应回到原始电平。
+    assert np.max(np.abs(result.mix[int(0.29 * sr):int(0.40 * sr), 0])) < 0.16
+    assert np.min(result.mix[int(0.68 * sr):int(0.70 * sr), 0]) == pytest.approx(0.283, abs=0.02)
+
+
+def test_ducking_range_export_continues_full_envelope(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "duck-slice"), sample_rate=sr)
+    voice = np.zeros(sr, dtype=np.float32)
+    voice[int(0.1 * sr):int(0.4 * sr)] = 0.8
+    project = _ducking_project(sess, tmp_path, control_values=voice, muted_control=True)
+
+    full = render(project, sess.load_source).mix
+    part = render(project, sess.load_source, start_time=0.25, end_time=0.75).mix
+    expected = full[int(0.25 * sr):int(0.75 * sr)]
+    assert part.shape == expected.shape
+    assert np.allclose(part, expected, atol=1e-6)
+    assert np.max(np.abs(part[0])) < 0.15  # 起点正处在讲话中，不是未触发状态
+
+
+def test_ducking_follows_moved_trimmed_gain_changed_control(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "duck-edit"), sample_rate=sr)
+    voice = np.zeros(sr, dtype=np.float32)
+    voice[:int(0.4 * sr)] = 0.8
+    project = _ducking_project(sess, tmp_path, control_values=voice)
+    before = render(project, sess.load_source).ducking_ranges[0]
+    assert before.start == pytest.approx(0.0, abs=2e-3)
+
+    clip = project.tracks[1].clips[0]
+    clip.start = 0.25
+    clip.in_point = 0.1
+    clip.out_point = 0.4
+    clip.gain_db = -3
+    after = render(project, sess.load_source).ducking_ranges[0]
+    assert after.start == pytest.approx(0.25, abs=3e-3)
+
+
+def test_ducking_presets_persist_and_original_mix_remains(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "duck-save"), sample_rate=sr)
+    voice = np.zeros(sr, dtype=np.float32)
+    voice[int(0.2 * sr):int(0.4 * sr)] = 0.8
+    project = _ducking_project(sess, tmp_path, control_values=voice, preset_id="b", muted_control=True)
+    ducked = render(project, sess.load_source).mix
+
+    sess.save()
+    reopened = Session.open(sess.root)
+    assert reopened.project.ducking["active_preset_id"] == "b"
+    assert len(reopened.project.ducking["presets"]) == 2
+    assert np.allclose(render(reopened.project, reopened.load_source).mix, ducked, atol=1e-6)
+
+    reopened.project.ducking["active_preset_id"] = "off"
+    original = render(reopened.project, reopened.load_source).mix
+    assert np.min(original[int(0.25 * sr):int(0.35 * sr), 0]) == pytest.approx(0.283, abs=0.01)

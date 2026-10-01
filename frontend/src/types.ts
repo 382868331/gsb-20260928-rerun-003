@@ -37,6 +37,23 @@ export interface TrackData {
   clips: ClipData[];
 }
 
+export interface DuckingPreset {
+  id: "a" | "b";
+  name: string;
+  threshold_db: number;
+  depth_db: number;
+  attack_sec: number;
+  hold_sec: number;
+  release_sec: number;
+}
+
+export interface DuckingConfig {
+  control_track_id: string | null;
+  target_track_ids: string[];
+  active_preset_id: "off" | "a" | "b";
+  presets: DuckingPreset[];
+}
+
 export interface ProjectData {
   format: string;
   version: number;
@@ -45,6 +62,7 @@ export interface ProjectData {
   channels: number;
   master_gain_db: number;
   tracks: TrackData[];
+  ducking?: DuckingConfig | null;
 }
 
 export interface MediaInfo {
@@ -62,4 +80,5 @@ export interface PreviewReport {
   over_range: boolean;
   over_count: number;
   over_ranges: { start: number; end: number }[];
+  ducking_ranges: { start: number; end: number }[];
 }

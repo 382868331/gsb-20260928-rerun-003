@@ -228,6 +228,8 @@ class Project:
     master_gain_db: float = 0.0
     tracks: list[Track] = field(default_factory=list)
     version: int = 1
+    # 侧链闪避配置。active_preset_id="off" 时完全保留原始混音。
+    ducking: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -238,6 +240,7 @@ class Project:
             "channels": self.channels,
             "master_gain_db": self.master_gain_db,
             "tracks": [t.to_dict() for t in self.tracks],
+            "ducking": self.ducking,
         }
 
     @classmethod
@@ -251,6 +254,7 @@ class Project:
             master_gain_db=float(data.get("master_gain_db", 0.0)),
             tracks=[Track.from_dict(t) for t in data.get("tracks", [])],
             version=int(data.get("version", 1)),
+            ducking=_ducking_from_dict(data.get("ducking")),
         )
         if project.sample_rate <= 0:
             raise ValueError("工程采样率非法")
@@ -280,3 +284,76 @@ class Project:
 
     def master_gain(self) -> float:
         return _db_to_gain(self.master_gain_db)
+
+    def active_ducking_preset(self) -> dict[str, Any] | None:
+        """返回当前启用的闪避参数；原始混音模式返回 None。"""
+        if not self.ducking:
+            return None
+        active_id = self.ducking.get("active_preset_id", "off")
+        if active_id == "off":
+            return None
+        for preset in self.ducking.get("presets", []):
+            if preset.get("id") == active_id:
+                return preset
+        return None
+
+
+def default_ducking() -> dict[str, Any]:
+    return {
+        "control_track_id": None,
+        "target_track_ids": [],
+        "active_preset_id": "off",
+        "presets": [
+            {
+                "id": "a",
+                "name": "设置 A",
+                "threshold_db": -25.0,
+                "depth_db": -12.0,
+                "attack_sec": 0.05,
+                "hold_sec": 0.15,
+                "release_sec": 0.60,
+            },
+            {
+                "id": "b",
+                "name": "设置 B",
+                "threshold_db": -30.0,
+                "depth_db": -15.0,
+                "attack_sec": 0.08,
+                "hold_sec": 0.25,
+                "release_sec": 1.20,
+            },
+        ],
+    }
+
+
+def _ducking_from_dict(data: Any) -> dict[str, Any] | None:
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        raise ValueError("侧链闪避配置必须是对象")
+    config = default_ducking()
+    config.update(data)
+    control = config.get("control_track_id")
+    config["control_track_id"] = None if control is None else str(control)
+    targets = config.get("target_track_ids", [])
+    if not isinstance(targets, list):
+        raise ValueError("闪避目标轨道必须是列表")
+    config["target_track_ids"] = [str(item) for item in targets]
+    if config["active_preset_id"] not in ("off", "a", "b"):
+        raise ValueError("未知闪避参数组")
+
+    defaults = {item["id"]: item for item in default_ducking()["presets"]}
+    normalized = []
+    for item in config.get("presets", []):
+        if not isinstance(item, dict) or item.get("id") not in defaults:
+            continue
+        preset = dict(defaults[item["id"]])
+        preset.update(item)
+        preset["threshold_db"] = float(preset["threshold_db"])
+        preset["depth_db"] = min(-0.1, max(-60.0, float(preset["depth_db"])))
+        preset["attack_sec"] = min(10.0, max(0.0, float(preset["attack_sec"])))
+        preset["hold_sec"] = min(10.0, max(0.0, float(preset["hold_sec"])))
+        preset["release_sec"] = min(30.0, max(0.0, float(preset["release_sec"])))
+        normalized.append(preset)
+    config["presets"] = normalized
+    return config

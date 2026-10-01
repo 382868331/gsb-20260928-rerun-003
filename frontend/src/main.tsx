@@ -5,6 +5,7 @@ import { useStudio } from "./store";
 import { Toolbar } from "./components/Toolbar";
 import { Timeline } from "./components/Timeline";
 import { Inspector } from "./components/Inspector";
+import { DuckingPanel } from "./components/DuckingPanel";
 import "./styles.css";
 
 function App() {
@@ -30,6 +31,7 @@ function App() {
     <div className="app">
       <Toolbar />
       {error && <div className="fatal-error">无法连接后端：{error}（请先运行 backend/run_server.py）</div>}
+      <DuckingPanel />
       <div className="workspace">
         <Timeline />
         <Inspector />

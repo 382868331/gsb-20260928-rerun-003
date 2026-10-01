@@ -1,4 +1,4 @@
-import type { MediaInfo, PreviewReport, ProjectData } from "./types";
+import type { DuckingConfig, MediaInfo, PreviewReport, ProjectData } from "./types";
 
 async function request(path: string, options?: RequestInit): Promise<unknown> {
   const response = await fetch(path, {
@@ -54,5 +54,18 @@ export interface ExportStatus {
   over_range: boolean;
   over_count: number;
   over_ranges: { start: number; end: number }[];
+  ducking_ranges?: { start: number; end: number }[];
   output_path: string | null;
+}
+
+export function defaultDucking(): DuckingConfig {
+  return {
+    control_track_id: null,
+    target_track_ids: [],
+    active_preset_id: "off",
+    presets: [
+      { id: "a", name: "设置 A", threshold_db: -25, depth_db: -12, attack_sec: 0.05, hold_sec: 0.15, release_sec: 0.6 },
+      { id: "b", name: "设置 B", threshold_db: -30, depth_db: -15, attack_sec: 0.08, hold_sec: 0.25, release_sec: 1.2 },
+    ],
+  };
 }

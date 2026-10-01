@@ -1,5 +1,6 @@
 import { create } from "zustand";
-import type { AutomationPointData, ClipData, EffectData, ProjectData, TrackData } from "./types";
+import type { AutomationPointData, ClipData, DuckingConfig, DuckingPreset, EffectData, ProjectData, TrackData } from "./types";
+import { defaultDucking } from "./api";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
@@ -28,6 +29,10 @@ interface StudioState {
   toggleSolo: (trackId: string) => void;
   setTrackGain: (trackId: string, gainDb: number) => void;
   setMasterGain: (gainDb: number) => void;
+  ensureDucking: () => void;
+  updateDucking: (patch: Partial<DuckingConfig>) => void;
+  updateDuckingPreset: (id: "a" | "b", patch: Partial<DuckingPreset>) => void;
+  toggleDuckingTarget: (trackId: string) => void;
   addClip: (trackId: string, source: string, duration: number) => void;
   moveClip: (trackId: string, clipId: string, start: number) => void;
   trimClip: (trackId: string, clipId: string, patch: TrimPatch) => void;
@@ -121,6 +126,40 @@ export const useStudio = create<StudioState>((set) => ({
 
   setMasterGain: (gainDb) =>
     set((state) => ({ project: { ...state.project, master_gain_db: gainDb } })),
+
+  ensureDucking: () =>
+    set((state) => state.project.ducking
+      ? {}
+      : { project: { ...state.project, ducking: defaultDucking() } }),
+
+  updateDucking: (patch) =>
+    set((state) => {
+      const ducking = state.project.ducking ?? defaultDucking();
+      return { project: { ...state.project, ducking: { ...ducking, ...patch } } };
+    }),
+
+  updateDuckingPreset: (id, patch) =>
+    set((state) => {
+      const ducking = state.project.ducking ?? defaultDucking();
+      return {
+        project: {
+          ...state.project,
+          ducking: {
+            ...ducking,
+            presets: ducking.presets.map((preset) => preset.id === id ? { ...preset, ...patch } : preset),
+          },
+        },
+      };
+    }),
+
+  toggleDuckingTarget: (trackId) =>
+    set((state) => {
+      const ducking = state.project.ducking ?? defaultDucking();
+      const target_track_ids = ducking.target_track_ids.includes(trackId)
+        ? ducking.target_track_ids.filter((id) => id !== trackId)
+        : [...ducking.target_track_ids, trackId];
+      return { project: { ...state.project, ducking: { ...ducking, target_track_ids } } };
+    }),
 
   addClip: (trackId, source, duration) =>
     set((state) => {

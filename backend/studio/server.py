@@ -31,6 +31,7 @@ class ExportJob:
         self.over_range = False
         self.over_count = 0
         self.over_ranges: list[dict] = []
+        self.ducking_ranges: list[dict] = []
         self._cancel = threading.Event()
 
     def request_cancel(self) -> None:
@@ -88,6 +89,9 @@ class StudioState:
             job.over_ranges = [
                 {"start": r.start, "end": r.end, "peak": r.peak}
                 for r in result.over_ranges
+            ]
+            job.ducking_ranges = [
+                {"start": r.start, "end": r.end} for r in result.ducking_ranges
             ]
             write_wav_atomic(
                 job.output_path, result.mix, result.sample_rate, subtype=subtype,
@@ -239,6 +243,9 @@ def make_handler(state: StudioState):
                 "over_ranges": [
                     {"start": r.start, "end": r.end} for r in result.over_ranges
                 ],
+                "ducking_ranges": [
+                    {"start": r.start, "end": r.end} for r in result.ducking_ranges
+                ],
             })
 
         def _start_export(self) -> None:
@@ -263,6 +270,9 @@ def make_handler(state: StudioState):
                         "over_ranges": [
                             {"start": r.start, "end": r.end} for r in result.over_ranges
                         ],
+                        "ducking_ranges": [
+                            {"start": r.start, "end": r.end} for r in result.ducking_ranges
+                        ],
                         "message": "叠加超出输出范围，确认降低增益后再导出，或勾选强制导出",
                     }, status=409)
                     return
@@ -286,6 +296,7 @@ def make_handler(state: StudioState):
                 "over_range": job.over_range,
                 "over_count": job.over_count,
                 "over_ranges": job.over_ranges,
+                "ducking_ranges": job.ducking_ranges,
                 "output_path": job.output_path if job.status == "done" else None,
             })
 
