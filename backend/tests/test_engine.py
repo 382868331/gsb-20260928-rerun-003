@@ -504,3 +504,117 @@ def test_repeated_and_cancelled_exports_do_not_accumulate(tmp_path):
     fourth = render(reopened.project, reopened.load_source, include_tail=True).mix
     assert fourth.shape == first.shape
     assert np.allclose(first, fourth, atol=1e-6)
+
+
+# ---------- 控制轨闪避背景音乐 ----------
+
+def _shape_wav(path: str, intervals: list[tuple[float, float]], sr: int = 44100) -> None:
+    sig = np.zeros(int(3.0 * sr), dtype=np.float32)
+    for start, end in intervals:
+        a, b = int(start * sr), int(end * sr)
+        sig[a:b] = 0.5
+    sf.write(path, sig[:, None], sr, subtype="PCM_16")
+
+
+def _duck_project(sess, control: str, music: str, active: str = "A") -> Project:
+    project = sess.project
+    project.tracks = [
+        Track("voice", "主持人", ducking_role="control", muted=True,
+              clips=[Clip("v", control, start=0.0, in_point=0.0, out_point=3.0)]),
+        Track("bgm", "背景音乐", ducking_role="music",
+              clips=[Clip("m", music, start=0.0, in_point=0.0, out_point=3.0)]),
+    ]
+    project.active_ducking = active
+    project.ducking_profiles["A"] = {
+        "threshold_db": -30.0, "reduction_db": 12.0,
+        "attack_sec": 0.02, "hold_sec": 0.10, "release_sec": 0.20,
+    }
+    project.ducking_profiles["B"] = {
+        "threshold_db": -30.0, "reduction_db": 24.0,
+        "attack_sec": 0.01, "hold_sec": 0.30, "release_sec": 0.80,
+    }
+    return project
+
+
+def test_ducking_pulse_hold_release_and_muted_control(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "duck-pulse"), sample_rate=sr)
+    _shape_wav(str(tmp_path / "pulse.wav"), [(0.50, 0.54)])
+    _tone(str(tmp_path / "music.wav"), 220, 3.0, sr=sr)
+    control = sess.import_file(str(tmp_path / "pulse.wav"), "pulse.wav").relpath
+    music = sess.import_file(str(tmp_path / "music.wav"), "music.wav").relpath
+    project = _duck_project(sess, control, music)
+
+    result = render(project, sess.load_source)
+    mix_peak = np.max(np.abs(result.mix), axis=1)
+    assert np.max(mix_peak[:int(0.48 * sr)]) > 0.3
+    assert np.max(mix_peak[int(0.54 * sr):int(0.63 * sr)]) < 0.15
+    recovering = np.max(mix_peak[int(0.78 * sr):int(0.84 * sr)])
+    assert recovering > 0.2
+    assert result.duck_ranges
+    assert result.duck_ranges[0].start < 0.53 < result.duck_ranges[0].end
+
+
+def test_ducking_mid_speech_export_starts_from_full_state(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "duck-mid"), sample_rate=sr)
+    _shape_wav(str(tmp_path / "speech.wav"), [(0.30, 1.40)])
+    _tone(str(tmp_path / "music.wav"), 220, 3.0, sr=sr)
+    control = sess.import_file(str(tmp_path / "speech.wav"), "speech.wav").relpath
+    music = sess.import_file(str(tmp_path / "music.wav"), "music.wav").relpath
+    project = _duck_project(sess, control, music)
+
+    full = render(project, sess.load_source).mix
+    segment = render(project, sess.load_source, start_time=0.7, end_time=1.1).mix
+    full_part = full[int(round(0.7 * sr)):int(round(1.1 * sr))]
+    assert np.allclose(segment, full_part, atol=1e-6)
+    assert np.max(np.abs(segment[:100])) < 0.15
+
+
+def test_ducking_adjacent_control_clips_follow_moves_trims_gain(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "duck-clips"), sample_rate=sr)
+    _shape_wav(str(tmp_path / "voice.wav"), [(0.00, 0.60), (0.60, 1.20)])
+    _tone(str(tmp_path / "music.wav"), 220, 3.0, sr=sr)
+    voice = sess.import_file(str(tmp_path / "voice.wav"), "voice.wav").relpath
+    music = sess.import_file(str(tmp_path / "music.wav"), "music.wav").relpath
+    project = _duck_project(sess, voice, music)
+    project.tracks[0].clips = [
+        Clip("v1", voice, start=0.4, in_point=0.0, out_point=0.6),
+        Clip("v2", voice, start=1.0, in_point=0.6, out_point=1.2),
+    ]
+    moved = render(project, sess.load_source)
+    gap_peak = np.max(np.abs(moved.mix[int(0.99 * sr):int(1.01 * sr)]))
+    assert gap_peak < 0.15  # 保持时间覆盖相接点
+    assert np.max(np.abs(moved.mix[:int(0.35 * sr)])) > 0.3
+
+    project.tracks[0].clips[0].gain_db = -30
+    quieter = render(project, sess.load_source)
+    first_range = quieter.duck_ranges[0].start if quieter.duck_ranges else 99.0
+    assert first_range > 0.9
+
+
+def test_ducking_profiles_compare_and_persist_with_original(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "duck-ab"), sample_rate=sr)
+    _shape_wav(str(tmp_path / "voice.wav"), [(0.5, 1.0)])
+    _tone(str(tmp_path / "music.wav"), 220, 3.0, sr=sr)
+    voice = sess.import_file(str(tmp_path / "voice.wav"), "voice.wav").relpath
+    music = sess.import_file(str(tmp_path / "music.wav"), "music.wav").relpath
+    project = _duck_project(sess, voice, music)
+
+    project.active_ducking = "none"
+    original = render(project, sess.load_source).mix
+    project.active_ducking = "A"
+    a = render(project, sess.load_source).mix
+    project.active_ducking = "B"
+    b = render(project, sess.load_source).mix
+    a_level = float(np.max(np.abs(a[int(0.75 * sr):int(0.85 * sr)])))
+    b_level = float(np.max(np.abs(b[int(0.75 * sr):int(0.85 * sr)])))
+    assert b_level < a_level < float(np.max(np.abs(original[int(0.75 * sr):int(0.85 * sr)])))
+
+    sess.save()
+    reopened = Session.open(sess.root)
+    assert reopened.project.active_ducking == "B"
+    assert reopened.project.ducking_profiles["A"]["release_sec"] == 0.20
+    assert np.allclose(render(reopened.project, reopened.load_source).mix, b, atol=1e-6)

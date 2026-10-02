@@ -3,6 +3,37 @@ import type { AutomationPointData, ClipData, EffectData, ProjectData, TrackData 
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
+const defaultProfileA = {
+  threshold_db: -30,
+  reduction_db: 12,
+  attack_sec: 0.08,
+  hold_sec: 0.18,
+  release_sec: 0.65,
+};
+
+const defaultProfileB = {
+  threshold_db: -24,
+  reduction_db: 18,
+  attack_sec: 0.04,
+  hold_sec: 0.3,
+  release_sec: 1.2,
+};
+
+function normalizeProject(project: ProjectData): ProjectData {
+  return {
+    ...project,
+    active_ducking: project.active_ducking ?? "none",
+    ducking_profiles: {
+      A: { ...defaultProfileA, ...project.ducking_profiles?.A },
+      B: { ...defaultProfileB, ...project.ducking_profiles?.B },
+    },
+    tracks: project.tracks.map((track) => ({
+      ...track,
+      ducking_role: track.ducking_role ?? "normal",
+    })),
+  };
+}
+
 export const emptyProject: ProjectData = {
   format: "audio-studio-project",
   version: 1,
@@ -10,6 +41,8 @@ export const emptyProject: ProjectData = {
   sample_rate: 44100,
   channels: 2,
   master_gain_db: 0,
+  active_ducking: "none",
+  ducking_profiles: { A: { ...defaultProfileA }, B: { ...defaultProfileB } },
   tracks: [],
 };
 
@@ -21,6 +54,9 @@ interface StudioState {
   selected: { trackId: string; clipId: string } | null;
   mediaDurations: Record<string, number>;
   setProject: (project: ProjectData) => void;
+  setTrackDuckingRole: (trackId: string, role: TrackData["ducking_role"]) => void;
+  setActiveDucking: (active: ProjectData["active_ducking"]) => void;
+  updateDuckingProfile: (name: "A" | "B", patch: Partial<ProjectData["ducking_profiles"]["A"]>) => void;
   select: (trackId: string, clipId: string | null) => void;
   addTrack: () => void;
   removeTrack: (trackId: string) => void;
@@ -54,6 +90,7 @@ function mutateTrack(project: ProjectData, trackId: string, fn: (track: TrackDat
         clips: track.clips.map((clip) => ({ ...clip, automation: [...clip.automation] })),
         effects: track.effects.map((effect) => ({ ...effect })),
         automation: [...track.automation],
+        ducking_role: track.ducking_role ?? "normal",
       };
       fn(next);
       return next;
@@ -78,7 +115,24 @@ export const useStudio = create<StudioState>((set) => ({
   selected: null,
   mediaDurations: {},
 
-  setProject: (project) => set({ project, selected: null }),
+  setProject: (project) => set({ project: normalizeProject(project), selected: null }),
+
+  setTrackDuckingRole: (trackId, role) =>
+    set((state) => ({ project: mutateTrack(state.project, trackId, (track) => { track.ducking_role = role; }) })),
+
+  setActiveDucking: (active) =>
+    set((state) => ({ project: { ...state.project, active_ducking: active } })),
+
+  updateDuckingProfile: (name, patch) =>
+    set((state) => ({
+      project: {
+        ...state.project,
+        ducking_profiles: {
+          ...state.project.ducking_profiles,
+          [name]: { ...state.project.ducking_profiles[name], ...patch },
+        },
+      },
+    })),
 
   select: (trackId, clipId) =>
     set({ selected: clipId === null ? null : { trackId, clipId } }),
@@ -98,6 +152,7 @@ export const useStudio = create<StudioState>((set) => ({
             pan: 0,
             effects: [],
             automation: [],
+            ducking_role: "normal",
             clips: [],
           },
         ],

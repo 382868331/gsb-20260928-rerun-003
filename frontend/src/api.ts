@@ -54,5 +54,6 @@ export interface ExportStatus {
   over_range: boolean;
   over_count: number;
   over_ranges: { start: number; end: number }[];
+  duck_ranges?: { start: number; end: number }[];
   output_path: string | null;
 }

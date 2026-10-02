@@ -34,7 +34,16 @@ export interface TrackData {
   pan: number;
   effects: EffectData[];
   automation: AutomationPointData[];
+  ducking_role: "normal" | "control" | "music";
   clips: ClipData[];
+}
+
+export interface DuckingProfile {
+  threshold_db: number;
+  reduction_db: number;
+  attack_sec: number;
+  hold_sec: number;
+  release_sec: number;
 }
 
 export interface ProjectData {
@@ -44,6 +53,8 @@ export interface ProjectData {
   sample_rate: number;
   channels: number;
   master_gain_db: number;
+  active_ducking: "none" | "A" | "B";
+  ducking_profiles: { A: DuckingProfile; B: DuckingProfile };
   tracks: TrackData[];
 }
 
@@ -62,4 +73,5 @@ export interface PreviewReport {
   over_range: boolean;
   over_count: number;
   over_ranges: { start: number; end: number }[];
+  duck_ranges?: { start: number; end: number }[];
 }

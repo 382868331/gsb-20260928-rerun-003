@@ -50,6 +50,7 @@ class RenderResult:
     over_range: bool
     over_count: int                 # 超范围采样点数
     over_ranges: list[OverRange] = field(default_factory=list)
+    duck_ranges: list[OverRange] = field(default_factory=list)
     duration: float = 0.0
     start_time: float = 0.0
     # 内容（片段/所选区间）本身的结束时间，与效果尾音的结束时间区分开。
@@ -203,6 +204,119 @@ def _over_ranges(flag: np.ndarray, sr: int, max_gap_samples: int = 64) -> tuple[
     ], int(idx.size)
 
 
+def _duck_envelope(level: np.ndarray, profile: dict[str, float], sr: int) -> np.ndarray:
+    """由控制电平生成 0..1 的闪避深度，1 表示完全达到压低量。"""
+    threshold = _db_to_gain(float(profile["threshold_db"]))
+    attack = max(1, int(round(float(profile["attack_sec"]) * sr)))
+    hold = max(0, int(round(float(profile["hold_sec"]) * sr)))
+    release = max(1, int(round(float(profile["release_sec"]) * sr)))
+    frames = level.shape[0]
+    depth = np.zeros(frames, dtype=np.float64)
+    if frames == 0:
+        return depth
+
+    trigger = level > threshold
+    if not np.any(trigger):
+        return depth
+
+    # 把间隔短于保持时间的相邻触发片段合并，停顿期间继续保持压低。
+    idx = np.flatnonzero(trigger)
+    groups: list[tuple[int, int]] = []
+    start = prev = int(idx[0])
+    for value in idx[1:]:
+        value = int(value)
+        if value - prev > hold + 1:
+            groups.append((start, prev))
+            start = value
+        prev = value
+    groups.append((start, prev))
+
+    pos = 0
+    current = 0.0
+    for first, last in groups:
+        held_last = min(frames - 1, last + hold)
+        gate_first = max(pos, first - attack)
+        if gate_first > pos:
+            release_frames = min(first - pos, release)
+            if release_frames > 0 and current > 0.0:
+                depth[pos:pos + release_frames] = current * (
+                    1.0 - np.arange(1, release_frames + 1) / release
+                )
+        pos = gate_first
+        attack_frames = max(1, first - pos)
+        needed = 1.0 - current
+        depth[pos:first] = current + needed * np.minimum(
+            1.0, (np.arange(attack_frames) + 1) / attack_frames
+        )
+        depth[first:held_last + 1] = 1.0
+        current = 1.0
+        pos = held_last + 1
+
+    if pos < frames and current > 0.0:
+        release_frames = min(frames - pos, release)
+        depth[pos:pos + release_frames] = 1.0 - np.minimum(
+            1.0, np.arange(release_frames) / release
+        )
+    return depth
+
+
+def _duck_gain(depth: np.ndarray, reduction_db: float) -> np.ndarray:
+    return np.power(10.0, -float(reduction_db) * np.clip(depth, 0.0, 1.0) / 20.0)
+
+
+def _render_track(
+    track: Track,
+    project: Project,
+    load_source: SourceLoader,
+    cache: dict[str, np.ndarray],
+    first_frame: int,
+    frames: int,
+) -> np.ndarray:
+    """从工程零点后的指定帧范围渲染一条轨，返回推子/声像后的立体声。"""
+    sr = project.sample_rate
+    end_frame = first_frame + frames
+    track_bus = np.zeros((frames, 2), dtype=np.float64)
+
+    def source(key: str) -> np.ndarray:
+        if key not in cache:
+            cache[key] = load_source(key)
+        return cache[key]
+
+    for clip in track.clips:
+        audio = source(clip.source)
+        segment = _clip_segment(audio, clip, sr)
+        clip_first = int(round(clip.start * sr))
+        clip_last = clip_first + segment.shape[0]
+        if clip_last <= first_frame or clip_first >= end_frame:
+            continue
+        local_first = max(clip_first, first_frame) - first_frame
+        local_last = min(clip_last, end_frame) - first_frame
+        src_first = max(clip_first, first_frame) - clip_first
+        part = segment[src_first:src_first + (local_last - local_first)].astype(np.float64)
+        part_frames = part.shape[0]
+        abs_times = (np.arange(part_frames) + first_frame + local_first) / sr
+        rel_times = abs_times - clip.start
+        gain_env = _db_to_gain_array(_envelope(clip.automation, "gain_db", rel_times, 0.0))
+        pan_env = _envelope(clip.automation, "pan", rel_times, 0.0)
+        part = part * (gain_env[:, None] * _db_to_gain(clip.gain_db))
+        if part.shape[1] == 1:
+            part = np.repeat(part, 2, axis=1)
+        if any(p.pan is not None for p in clip.automation):
+            part = _apply_pan(part, pan_env)
+        track_bus[local_first:local_last] += part
+
+    abs_times = (np.arange(frames) + first_frame) / sr
+    amount_env = _envelope(track.automation, "amount", abs_times, 1.0)
+    for effect in track.effects:
+        track_bus = _run_effect(track_bus, effect, sr, amount_env)
+
+    track_gain_env = _db_to_gain_array(
+        _envelope(track.automation, "gain_db", abs_times, track.gain_db)
+    )
+    track_pan_env = _envelope(track.automation, "pan", abs_times, track.pan)
+    return _apply_pan(track_bus, track_pan_env) * track_gain_env[:, None]
+
+
 def render(
     project: Project,
     load_source: SourceLoader,
@@ -224,97 +338,54 @@ def render(
     sr = project.sample_rate
     channels = project.channels
 
-    # 先确定渲染区间。默认渲染整段（长度由所有素材决定，含静音/未独听轨）。
+    # 先确定渲染区间；所有有状态处理都从工程零点计算后再截取。
     timeline_end = project.timeline_length()
-    if end_time is None:
-        end_time = timeline_end if duration is None else start_time + duration
+    requested_end = timeline_end if end_time is None else float(end_time)
+    if end_time is None and duration is not None:
+        requested_end = float(start_time) + duration
     start_time = max(0.0, float(start_time))
-    end_time = max(start_time, float(end_time))
-    content_end_time = end_time
-    tail = effect_tail_seconds(project)
+    content_end_time = max(start_time, requested_end)
+    profile = project.ducking_profile()
+    duck_tail = float(profile["release_sec"]) if profile is not None else 0.0
+    render_end_time = content_end_time
     if include_tail:
-        # 允许导出所选片段及其自然衰减的尾音：区间结束不等于声音结束。
-        end_time = end_time + tail
+        render_end_time += max(effect_tail_seconds(project), duck_tail)
     start_frame = int(round(start_time * sr))
-    total_frames = int(round(end_time * sr)) - start_frame
-    total_frames = max(0, total_frames)
-
-    # 预卷：效果器（如延迟/回声）在区间起点之前就有状态。从起点向前
-    # 多渲染一个尾长再裁掉，使分段渲染与整段渲染在衔接处逐采样一致，
-    # 分段起点不会丢失前面的效果状态。
-    pre_frames = min(start_frame, int(round(tail * sr))) if start_frame > 0 else 0
-    render_start_frame = start_frame - pre_frames
-    render_frames = total_frames + pre_frames
+    render_end_frame = max(start_frame, int(round(render_end_time * sr)))
+    total_frames = render_end_frame - start_frame
     bus = np.zeros((total_frames, channels), dtype=np.float64)
 
     cache: dict[str, np.ndarray] = {}
-
-    def get_source(key: str) -> np.ndarray:
-        if key not in cache:
-            data = load_source(key)
-            if data.ndim != 2:
-                raise RenderError(f"素材 {key} 未统一到工程格式")
-            cache[key] = data
-        return cache[key]
-
-    for track in project.active_tracks():
-        if should_cancel and should_cancel():
-            from .audio import ExportCancelled
-            raise ExportCancelled()
-
-        # 先把整条轨道在（含预卷的）渲染区间内的素材混合成轨道缓冲（立体声）。
-        track_bus = np.zeros((render_frames, 2), dtype=np.float64)
-        for clip in track.clips:
-            source = get_source(clip.source)  # 可能是单声道或立体声缓存
-            segment = _clip_segment(source, clip, sr)
-            clip_first = int(round(clip.start * sr))
-            clip_last = clip_first + segment.shape[0]
-            if clip_last <= render_start_frame or clip_first >= render_start_frame + render_frames:
+    if profile is not None and any(t.ducking_role == "control" for t in project.tracks):
+        control_level = np.zeros(render_end_frame, dtype=np.float64)
+        for track in project.tracks:
+            if track.ducking_role != "control":
                 continue
-            local_first = max(clip_first, render_start_frame) - render_start_frame
-            local_last = min(clip_last, render_start_frame + render_frames) - render_start_frame
-            src_first = max(clip_first, render_start_frame) - clip_first
-            part = segment[src_first:src_first + (local_last - local_first)].astype(np.float64)
+            if should_cancel and should_cancel():
+                from .audio import ExportCancelled
+                raise ExportCancelled()
+            rendered = _render_track(track, project, load_source, cache, 0, render_end_frame)
+            control_level = np.maximum(control_level, np.max(np.abs(rendered), axis=1))
+        duck_depth = _duck_envelope(control_level, profile, sr)
+    else:
+        duck_depth = np.zeros(render_end_frame, dtype=np.float64)
 
-            frames_n = local_last - local_first
-            local_times = (np.arange(frames_n) + render_start_frame + local_first) / sr
-            rel_times = local_times - clip.start
-            # 素材内自动化：时间相对素材起点，移动素材时断点一起移动。
-            gain_env = _db_to_gain_array(_envelope(clip.automation, "gain_db", rel_times, 0.0))
-            pan_env = _envelope(clip.automation, "pan", rel_times, 0.0)
-            part = part * (gain_env[:, None] * _db_to_gain(clip.gain_db))
-            # 素材声像自动化时才在素材级摆位；否则保持原声道，声像交给轨道级统一处理。
-            if part.shape[1] == 1:
-                part = np.repeat(part, 2, axis=1)
-            if any(p.pan is not None for p in clip.automation):
-                part = _apply_pan(part, pan_env)
-            track_bus[local_first:local_last] += part
-
+    audible_ids = {track.id for track in project.active_tracks()}
+    for track in project.tracks:
+        if track.id not in audible_ids:
+            continue
         if should_cancel and should_cancel():
             from .audio import ExportCancelled
             raise ExportCancelled()
 
-        # 轨道效果器链：强度可被工程绝对时间自动化（不随素材移动）。
-        # 效果器在含预卷的缓冲上执行，状态从区间起点之前延续过来。
-        abs_times = (np.arange(render_frames) + render_start_frame) / sr
-        amount_env = _envelope(track.automation, "amount", abs_times, 1.0)
-        for effect in track.effects:
-            # amount 自动化对整条链统一生效（无断点时效果器用自身 amount）。
-            track_bus = _run_effect(track_bus, effect, sr, amount_env)
-
-        # 裁掉预卷部分：效果状态已延续进区间，预卷声音本身不输出。
-        track_bus = track_bus[pre_frames:]
-
-        # 轨道推子与轨道级自动化：绝对工程时间，素材移动不影响它们。
-        # 逐采样按绝对时间插值，区间边界处取值与整段渲染完全一致。
-        abs_times = (np.arange(total_frames) + start_frame) / sr
-        track_gain_env = _db_to_gain_array(
-            _envelope(track.automation, "gain_db", abs_times, track.gain_db)
-        )
-        track_pan_env = _envelope(track.automation, "pan", abs_times, track.pan)
-        track_bus = _apply_pan(track_bus, track_pan_env) * track_gain_env[:, None]
+        track_bus = _render_track(track, project, load_source, cache, 0, render_end_frame)
+        if should_cancel and should_cancel():
+            from .audio import ExportCancelled
+            raise ExportCancelled()
+        if profile is not None and track.ducking_role == "music":
+            track_bus = track_bus * _duck_gain(duck_depth, profile["reduction_db"])[:, None]
+        track_bus = track_bus[start_frame:]
         if channels == 1:
-            # 工程为单声道时，把摆位后的立体声等比例混合回单声道。
             bus[:, 0] += track_bus.mean(axis=1)
         else:
             bus[:, :] += track_bus
@@ -325,6 +396,11 @@ def render(
     over_flags = np.max(np.abs(bus), axis=1) > 1.0
     ranges, over_count = _over_ranges(over_flags, sr)
     for item in ranges:
+        item.start += start_time
+        item.end += start_time
+
+    duck_ranges, _duck_count = _over_ranges(duck_depth[start_frame:] > 0.05, sr, max_gap_samples=1)
+    for item in duck_ranges:
         item.start += start_time
         item.end += start_time
 
@@ -340,6 +416,7 @@ def render(
         over_range=over_count > 0 or peak > 1.0,
         over_count=over_count,
         over_ranges=ranges,
+        duck_ranges=duck_ranges,
         duration=total_frames / sr,
         start_time=start_frame / sr,
         content_end_time=content_end_time,

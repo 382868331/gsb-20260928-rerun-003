@@ -185,6 +185,8 @@ class Track:
     effects: list[dict[str, Any]] = field(default_factory=list)
     # 轨道级自动化：工程绝对时间（不随素材移动）。
     automation: list[AutomationPoint] = field(default_factory=list)
+    # normal=普通；control=闪避控制（静音也检测）；music=被压低的背景音乐。
+    ducking_role: str = "normal"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -196,6 +198,7 @@ class Track:
             "pan": self.pan,
             "effects": list(self.effects),
             "automation": _automation_to_dict(self.automation),
+            "ducking_role": self.ducking_role,
             "clips": [c.to_dict() for c in self.clips],
         }
 
@@ -211,11 +214,32 @@ class Track:
             pan=min(1.0, max(-1.0, float(data.get("pan", 0.0)))),
             effects=list(data.get("effects", [])),
             automation=_automation_from_dict(data.get("automation", [])),
+            ducking_role=str(data.get("ducking_role", "normal")),
         )
         for effect in track.effects:
             if not isinstance(effect, dict) or "type" not in effect:
                 raise ValueError("效果器节点必须是带 type 的对象")
+        if track.ducking_role not in ("normal", "control", "music"):
+            raise ValueError("闪避轨道角色必须是 normal、control 或 music")
         return track
+
+
+DEFAULT_DUCKING_PROFILES: dict[str, dict[str, float]] = {
+    "A": {
+        "threshold_db": -30.0,
+        "reduction_db": 12.0,
+        "attack_sec": 0.08,
+        "hold_sec": 0.18,
+        "release_sec": 0.65,
+    },
+    "B": {
+        "threshold_db": -24.0,
+        "reduction_db": 18.0,
+        "attack_sec": 0.04,
+        "hold_sec": 0.30,
+        "release_sec": 1.20,
+    },
+}
 
 
 @dataclass
@@ -228,6 +252,13 @@ class Project:
     master_gain_db: float = 0.0
     tracks: list[Track] = field(default_factory=list)
     version: int = 1
+    # none=保留原混音；A/B=使用两套闪避设置，便于保存后继续比较。
+    active_ducking: str = "none"
+    ducking_profiles: dict[str, dict[str, float]] = field(
+        default_factory=lambda: {
+            name: dict(values) for name, values in DEFAULT_DUCKING_PROFILES.items()
+        }
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -237,6 +268,8 @@ class Project:
             "sample_rate": self.sample_rate,
             "channels": self.channels,
             "master_gain_db": self.master_gain_db,
+            "active_ducking": self.active_ducking,
+            "ducking_profiles": self.ducking_profiles,
             "tracks": [t.to_dict() for t in self.tracks],
         }
 
@@ -251,11 +284,16 @@ class Project:
             master_gain_db=float(data.get("master_gain_db", 0.0)),
             tracks=[Track.from_dict(t) for t in data.get("tracks", [])],
             version=int(data.get("version", 1)),
+            active_ducking=str(data.get("active_ducking", "none")),
+            ducking_profiles=_ducking_profiles_from_dict(data.get("ducking_profiles")),
         )
         if project.sample_rate <= 0:
             raise ValueError("工程采样率非法")
         if project.channels not in (1, 2):
             raise ValueError("目前只支持单声道/立体声输出")
+        if project.active_ducking not in ("none", "A", "B"):
+            raise ValueError("闪避设置必须是 none、A 或 B")
+        _validate_ducking_profiles(project.ducking_profiles)
         return project
 
     def active_tracks(self) -> list[Track]:
@@ -280,3 +318,33 @@ class Project:
 
     def master_gain(self) -> float:
         return _db_to_gain(self.master_gain_db)
+
+    def ducking_profile(self) -> dict[str, float] | None:
+        if self.active_ducking == "none":
+            return None
+        return dict(self.ducking_profiles[self.active_ducking])
+
+
+def _validate_ducking_profiles(profiles: dict[str, dict[str, float]]) -> None:
+    required = {"threshold_db", "reduction_db", "attack_sec", "hold_sec", "release_sec"}
+    for name in ("A", "B"):
+        profile = profiles.get(name)
+        if not isinstance(profile, dict) or not required.issubset(profile):
+            raise ValueError(f"闪避设置 {name} 参数不完整")
+        for key in ("attack_sec", "hold_sec", "release_sec"):
+            if float(profile[key]) < 0.0:
+                raise ValueError("闪避时间参数不能为负")
+        if float(profile["reduction_db"]) < 0.0:
+            raise ValueError("闪低压低量不能为负")
+
+
+def _ducking_profiles_from_dict(data: Any) -> dict[str, dict[str, float]]:
+    profiles = {
+        name: dict(values) for name, values in DEFAULT_DUCKING_PROFILES.items()
+    }
+    if isinstance(data, dict):
+        for name in profiles:
+            incoming = data.get(name)
+            if isinstance(incoming, dict):
+                profiles[name].update({k: float(v) for k, v in incoming.items()})
+    return profiles

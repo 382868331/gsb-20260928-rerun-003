@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, type ExportStatus } from "../api";
 import { useStudio } from "../store";
 import type { MediaInfo, PreviewReport } from "../types";
+import { DuckingPanel } from "./DuckingPanel";
 
 export function Toolbar() {
   const { project, addClip, rememberMedia, mediaDurations, setMasterGain } = useStudio();
@@ -156,6 +157,7 @@ export function Toolbar() {
       {Object.keys(mediaDurations).length === 0 && (
         <div className="toolbar-row hint">先点击“导入素材”，把音频文件复制进工程 media 目录（源文件不会被修改）。</div>
       )}
+      <DuckingPanel preview={preview} onPreview={checkMix} />
     </div>
   );
 }

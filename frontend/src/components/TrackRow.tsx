@@ -12,7 +12,7 @@ interface Props {
 export function TrackRow({ track, pixelsPerSecond, timelineWidth, anySolo }: Props) {
   const {
     selected, select, toggleMute, toggleSolo, setTrackGain, removeTrack,
-    moveClip, trimClipLive, trimClip, removeClip, setClipAutomation,
+    moveClip, trimClipLive, trimClip, removeClip, setClipAutomation, setTrackDuckingRole,
   } = useStudio();
 
   return (
@@ -50,10 +50,19 @@ export function TrackRow({ track, pixelsPerSecond, timelineWidth, anySolo }: Pro
             onChange={(e) => setTrackGain(track.id, Number(e.target.value))}
           />
         </label>
+        <label className="duck-role">
+          闪避
+          <select value={track.ducking_role} onChange={(e) =>
+            setTrackDuckingRole(track.id, e.target.value as "normal" | "control" | "music")}>
+            <option value="normal">普通</option>
+            <option value="control">控制</option>
+            <option value="music">背景</option>
+          </select>
+        </label>
       </div>
       <div className="track-lane" style={{ width: timelineWidth }}>
         <div className="effects-slot">
-          效果器 {track.effects.length} 个 · 轨道自动化 {track.automation.length} 点 · 声像 {track.pan.toFixed(2)}
+          效果器 {track.effects.length} 个 · 轨道自动化 {track.automation.length} 点 · {track.ducking_role === "control" ? "控制轨" : track.ducking_role === "music" ? "背景音轨" : "普通轨"}
         </div>
         {track.clips.map((clip) => (
           <ClipView
