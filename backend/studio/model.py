@@ -297,12 +297,30 @@ class Project:
                 return preset
         return None
 
+    def active_ducking_scheme(self) -> dict[str, Any] | None:
+        """返回当前启用的多控制源闪避方案；未启用返回 None。
+
+        方案（scheme）是一组自包含的快照：角色、优先级、合成规则、目标轨
+        全部存在方案内部，修改任一方案不会影响其他已保存方案。
+        """
+        if not self.ducking:
+            return None
+        active_id = self.ducking.get("active_scheme_id")
+        if not active_id:
+            return None
+        for scheme in self.ducking.get("schemes", []):
+            if scheme.get("id") == active_id:
+                return scheme
+        return None
+
 
 def default_ducking() -> dict[str, Any]:
     return {
         "control_track_id": None,
         "target_track_ids": [],
         "active_preset_id": "off",
+        "active_scheme_id": None,
+        "schemes": [],
         "presets": [
             {
                 "id": "a",
@@ -324,6 +342,97 @@ def default_ducking() -> dict[str, Any]:
             },
         ],
     }
+
+
+DUCK_COMBINE_MODES = ("strongest", "priority", "multiply")
+DUCK_TAPS = ("pre", "post")
+
+
+def default_scheme(scheme_id: str, name: str) -> dict[str, Any]:
+    """一份多控制源闪避方案的默认值（自包含快照）。
+
+    combine_mode:
+      strongest — 同时发声时由压低较强（瞬时增益更低）的角色主导；
+      priority  — 由 priority 更高的在场角色主导，交接按 handover_sec 连续过渡；
+      multiply  — 各角色压低量按明确的合成规则共同作用（增益相乘）。
+    """
+    return {
+        "id": scheme_id,
+        "name": name,
+        "combine_mode": "strongest",
+        "threshold_db": -25.0,
+        "attack_sec": 0.05,
+        "hold_sec": 0.15,
+        "release_sec": 0.60,
+        "handover_sec": 0.05,
+        "roles": [],
+    }
+
+
+def default_role(role_id: str, name: str) -> dict[str, Any]:
+    """一个角色：若干控制音轨归为一组，共享压低程度与优先级。
+
+    tap: pre = 取该控制轨被任何闪避处理前的声音；
+         post = 取被其他角色压低之后的声音（受控轨再作为控制源时使用）。
+    """
+    return {
+        "id": role_id,
+        "name": name,
+        "control_track_ids": [],
+        "target_track_ids": [],
+        "depth_db": -12.0,
+        "priority": 0,
+        "tap": "pre",
+    }
+
+
+def _dedupe_ids(items: Any) -> list[str]:
+    """同一来源重复归组只保留一次，避免同一控制轨被多压一次。"""
+    seen: list[str] = []
+    if not isinstance(items, list):
+        return seen
+    for item in items:
+        key = str(item)
+        if key not in seen:
+            seen.append(key)
+    return seen
+
+
+def _role_from_dict(data: Any, index: int) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    role = default_role(str(data.get("id") or f"role-{index + 1}"),
+                        str(data.get("name") or f"角色 {index + 1}"))
+    role.update({k: v for k, v in data.items() if k in role})
+    role["control_track_ids"] = _dedupe_ids(role["control_track_ids"])
+    role["target_track_ids"] = _dedupe_ids(role["target_track_ids"])
+    role["depth_db"] = min(-0.1, max(-60.0, float(role["depth_db"])))
+    role["priority"] = min(99, max(0, int(role["priority"])))
+    if role["tap"] not in DUCK_TAPS:
+        role["tap"] = "pre"
+    return role
+
+
+def _scheme_from_dict(data: Any, index: int) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    scheme = default_scheme(str(data.get("id") or f"scheme-{index + 1}"),
+                            str(data.get("name") or f"方案 {index + 1}"))
+    scheme.update({k: v for k, v in data.items() if k in scheme and k != "roles"})
+    if scheme["combine_mode"] not in DUCK_COMBINE_MODES:
+        scheme["combine_mode"] = "strongest"
+    scheme["threshold_db"] = min(0.0, max(-90.0, float(scheme["threshold_db"])))
+    scheme["attack_sec"] = min(10.0, max(0.0, float(scheme["attack_sec"])))
+    scheme["hold_sec"] = min(10.0, max(0.0, float(scheme["hold_sec"])))
+    scheme["release_sec"] = min(30.0, max(0.0, float(scheme["release_sec"])))
+    scheme["handover_sec"] = min(5.0, max(0.0, float(scheme["handover_sec"])))
+    roles = []
+    for role_index, item in enumerate(data.get("roles", [])):
+        role = _role_from_dict(item, role_index)
+        if role is not None:
+            roles.append(role)
+    scheme["roles"] = roles
+    return scheme
 
 
 def _ducking_from_dict(data: Any) -> dict[str, Any] | None:
@@ -356,4 +465,12 @@ def _ducking_from_dict(data: Any) -> dict[str, Any] | None:
         preset["release_sec"] = min(30.0, max(0.0, float(preset["release_sec"])))
         normalized.append(preset)
     config["presets"] = normalized
+    schemes = []
+    for scheme_index, item in enumerate(config.get("schemes", [])):
+        scheme = _scheme_from_dict(item, scheme_index)
+        if scheme is not None:
+            schemes.append(scheme)
+    config["schemes"] = schemes
+    active_scheme = config.get("active_scheme_id")
+    config["active_scheme_id"] = None if active_scheme is None else str(active_scheme)
     return config

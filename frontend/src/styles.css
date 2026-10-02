@@ -74,6 +74,18 @@ button:hover { background: #353b4d; }
 .duck-modes button { padding: 2px 7px; font-size: 10px; }
 .ducking-params { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 10px; }
 .ducking-params input[type="range"] { width: 100%; }
+.scheme-panel { margin-top: 8px; }
+.scheme-bar { display: flex; gap: 10px; align-items: flex-end; margin-bottom: 8px; }
+.scheme-bar label { min-width: 260px; }
+.scheme-grid { grid-template-columns: repeat(4, 1fr); }
+.scheme-roles { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.scheme-roles-head { display: flex; justify-content: space-between; align-items: center; }
+.scheme-role { border: 1px solid #2a3550; border-radius: 6px; padding: 8px; }
+.scheme-role-head { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.scheme-role-head input[type="text"] { width: 140px; }
+.scheme-role-tracks { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 6px; }
+.scheme-actions { display: flex; gap: 10px; margin-top: 10px; }
+.scheme-validation { margin-top: 8px; font-size: 11px; color: #aebbd5; display: flex; flex-direction: column; gap: 3px; }
 .duck-note, .duck-message { margin-top: 8px; color: #ffd166; font-size: 11px; }
 .duck-compare { display: flex; gap: 8px; margin-top: 10px; }
 .duck-report { display: flex; flex-direction: column; gap: 2px; padding: 6px 10px; border-radius: 6px; background: #20283a; min-width: 110px; font-size: 11px; }

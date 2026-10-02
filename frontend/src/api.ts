@@ -1,4 +1,4 @@
-import type { DuckingConfig, MediaInfo, PreviewReport, ProjectData } from "./types";
+import type { DuckingConfig, DuckingRole, DuckingScheme, DuckingValidation, MediaInfo, PreviewReport, ProjectData } from "./types";
 
 async function request(path: string, options?: RequestInit): Promise<unknown> {
   const response = await fetch(path, {
@@ -32,6 +32,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify(project),
     }) as Promise<PreviewReport>,
+  validateDucking: (project: ProjectData) =>
+    request("/api/ducking/validate", {
+      method: "POST",
+      body: JSON.stringify(project),
+    }) as Promise<DuckingValidation>,
   startExport: (outputPath: string, allowOverRange: boolean,
     range?: { start_time?: number; end_time?: number; include_tail?: boolean }) =>
     request("/api/export", {
@@ -55,6 +60,7 @@ export interface ExportStatus {
   over_count: number;
   over_ranges: { start: number; end: number }[];
   ducking_ranges?: { start: number; end: number }[];
+  ducking_segments?: { start: number; end: number; role_id: string; role_name: string }[];
   output_path: string | null;
 }
 
@@ -63,9 +69,37 @@ export function defaultDucking(): DuckingConfig {
     control_track_id: null,
     target_track_ids: [],
     active_preset_id: "off",
+    active_scheme_id: null,
+    schemes: [],
     presets: [
       { id: "a", name: "设置 A", threshold_db: -25, depth_db: -12, attack_sec: 0.05, hold_sec: 0.15, release_sec: 0.6 },
       { id: "b", name: "设置 B", threshold_db: -30, depth_db: -15, attack_sec: 0.08, hold_sec: 0.25, release_sec: 1.2 },
     ],
+  };
+}
+
+export function defaultScheme(id: string, name: string): DuckingScheme {
+  return {
+    id,
+    name,
+    combine_mode: "strongest",
+    threshold_db: -25,
+    attack_sec: 0.05,
+    hold_sec: 0.15,
+    release_sec: 0.6,
+    handover_sec: 0.05,
+    roles: [],
+  };
+}
+
+export function defaultRole(id: string, name: string): DuckingRole {
+  return {
+    id,
+    name,
+    control_track_ids: [],
+    target_track_ids: [],
+    depth_db: -12,
+    priority: 0,
+    tap: "pre",
   };
 }

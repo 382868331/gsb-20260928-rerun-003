@@ -41,6 +41,15 @@ class OverRange:
 
 
 @dataclass
+class DuckSegment:
+    """一段“当前由谁控制音乐”的记录。"""
+    start: float
+    end: float
+    role_id: str
+    role_name: str
+
+
+@dataclass
 class RenderResult:
     mix: np.ndarray                 # float32, [帧, 声道]，应用主控增益后
     sample_rate: int
@@ -51,6 +60,7 @@ class RenderResult:
     over_count: int                 # 超范围采样点数
     over_ranges: list[OverRange] = field(default_factory=list)
     ducking_ranges: list[OverRange] = field(default_factory=list)
+    ducking_segments: list[DuckSegment] = field(default_factory=list)
     duration: float = 0.0
     start_time: float = 0.0
     # 内容（片段/所选区间）本身的结束时间，与效果尾音的结束时间区分开。
@@ -256,8 +266,13 @@ def _render_track_bus(
 
 def _ducking_gain_envelope(control: np.ndarray, preset: dict, sr: int) -> np.ndarray:
     """从控制轨电平计算攻击/保持/释放后的背景音乐增益。"""
+    return _ducking_gain_and_trigger(control, preset, sr)[0]
+
+
+def _ducking_gain_and_trigger(control: np.ndarray, preset: dict, sr: int) -> tuple[np.ndarray, np.ndarray]:
+    """计算增益包络，并同时返回触发掩码（讲话中+保持期，不含释放尾）。"""
     if control.size == 0:
-        return np.ones(0, dtype=np.float64)
+        return np.ones(0, dtype=np.float64), np.zeros(0, dtype=bool)
     level = np.max(np.abs(control), axis=1)
     threshold = _db_to_gain(float(preset["threshold_db"]))
     frames = level.shape[0]
@@ -284,7 +299,245 @@ def _ducking_gain_envelope(control: np.ndarray, preset: dict, sr: int) -> np.nda
             current += (1.0 - depth_gain) / release_frames
             current = min(current, 1.0)
         gain[i] = current
-    return gain
+    return gain, trigger
+
+
+def _role_dependencies(scheme: dict) -> dict[str, set[str]]:
+    """角色间依赖：post（处理后）取数的角色依赖压低其控制轨的角色。"""
+    roles = scheme.get("roles", [])
+    deps: dict[str, set[str]] = {role["id"]: set() for role in roles}
+    for role in roles:
+        if role.get("tap") != "post":
+            continue
+        controls = set(role.get("control_track_ids", []))
+        # 处理后取数又压低自己的控制轨：自我引用，同样无法解释。
+        if controls & set(role.get("target_track_ids", [])):
+            deps[role["id"]].add(role["id"])
+        for other in roles:
+            if other["id"] == role["id"]:
+                continue
+            if controls & set(other.get("target_track_ids", [])):
+                deps[role["id"]].add(other["id"])
+    return deps
+
+
+def _find_cycle(deps: dict[str, set[str]]) -> list[str] | None:
+    """在角色依赖图中找一条相互控制环；无环返回 None。"""
+    visiting: list[str] = []
+    state: dict[str, int] = {}
+
+    def visit(node: str) -> list[str] | None:
+        state[node] = 1
+        visiting.append(node)
+        for nxt in sorted(deps.get(node, ())):
+            if state.get(nxt) == 1:
+                return visiting[visiting.index(nxt):] + [nxt]
+            if state.get(nxt) is None:
+                found = visit(nxt)
+                if found:
+                    return found
+        visiting.pop()
+        state[node] = 2
+        return None
+
+    for node in sorted(deps):
+        if state.get(node) is None:
+            found = visit(node)
+            if found:
+                return found
+    return None
+
+
+def _topological_roles(scheme: dict) -> list[dict]:
+    """按依赖关系排出计算顺序；相互控制成环时拒绝渲染（不悄悄只算一部分）。"""
+    roles = scheme.get("roles", [])
+    deps = _role_dependencies(scheme)
+    cycle = _find_cycle(deps)
+    if cycle:
+        names = {role["id"]: role.get("name", role["id"]) for role in roles}
+        chain = " → ".join(names.get(item, item) for item in cycle)
+        raise RenderError(f"闪避角色形成无法解释的相互控制：{chain}")
+    by_id = {role["id"]: role for role in roles}
+    done: set[str] = set()
+    order: list[dict] = []
+    remaining = sorted(roles, key=lambda r: (-int(r.get("priority", 0)), r["id"]))
+    while remaining:
+        ready = [r for r in remaining if deps[r["id"]] <= done]
+        for role in ready:
+            order.append(role)
+            done.add(role["id"])
+        remaining = [r for r in remaining if r["id"] not in done]
+    return [by_id[role["id"]] for role in order]
+
+
+def _combine_role_gains(
+    entries: list[tuple[dict, np.ndarray, np.ndarray]], mode: str, handover_frames: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """把多个角色对同一目标轨的增益包络按合成规则合并。
+
+    entries 为 (角色, 增益包络, 触发掩码)。触发掩码只含讲话与保持期，
+    不含释放尾：一人停下后不再占用主导权，仍在讲话的另一人立即接管，
+    交接按 handover 长度交叉淡化，保证增益连续不跳变。
+
+    返回 (合并增益, 每采样主导角色在 entries 中的序号，-1 表示无角色在场)。
+    strongest：瞬时压低较强者主导（取最小增益，天然连续）。
+    multiply：各角色共同作用（增益相乘，天然连续）。
+    priority：优先级最高的在场（触发中）角色主导；无人触发时跟随
+              剩余释放尾中较强者，保证释放过程自然。
+    """
+    frames = entries[0][1].shape[0]
+    gains = np.stack([env for _role, env, _trig in entries])
+    speaking = np.stack([trig for _role, _env, trig in entries])
+    any_speaking = speaking.any(axis=0)
+    any_ducking = (gains < 0.999).any(axis=0)
+
+    def strongest_winner() -> np.ndarray:
+        winner = np.full(frames, -1, dtype=int)
+        # 优先在触发中的角色里选最强者；无人触发时归属仍在释放的角色。
+        pool = np.where(speaking, gains, np.inf)
+        winner[any_speaking] = np.argmin(pool, axis=0)[any_speaking]
+        rest = ~any_speaking & any_ducking
+        winner[rest] = np.argmin(gains, axis=0)[rest]
+        return winner
+
+    if mode == "multiply":
+        gain = np.prod(gains, axis=0)
+        return gain, strongest_winner()
+
+    if mode == "priority":
+        order = sorted(
+            range(len(entries)),
+            key=lambda i: (-int(entries[i][0].get("priority", 0)), entries[i][0]["id"]),
+        )
+        winner = np.full(frames, -1, dtype=int)
+        for idx in order:
+            take = speaking[idx] & (winner < 0)
+            winner[take] = idx
+        gain = np.ones(frames, dtype=np.float64)
+        for idx, (_role, env, _trig) in enumerate(entries):
+            gain[winner == idx] = env[winner == idx]
+        # 无人触发时跟随剩余释放尾（通常刚停下的角色），释放自然完成。
+        idle = winner < 0
+        gain[idle] = np.min(gains, axis=0)[idle]
+        # 交接点交叉淡化：从旧值线性滑向新主导角色的包络，保证连续。
+        changes = np.flatnonzero(np.diff(winner) != 0) + 1
+        handover = max(1, handover_frames)
+        for change in changes:
+            end = min(frames, int(change) + handover)
+            ramp = np.linspace(0.0, 1.0, end - int(change))
+            start_value = gain[int(change) - 1]
+            gain[int(change):end] = start_value + (gain[int(change):end] - start_value) * ramp
+        return gain, winner
+
+    # strongest：较强者主导。
+    gain = np.min(gains, axis=0)
+    return gain, strongest_winner()
+
+
+def _scheme_duck_envelopes(
+    project: Project,
+    scheme: dict,
+    get_source: Callable[[str], np.ndarray],
+    envelope_frames: int,
+    sr: int,
+) -> dict:
+    """计算方案中每个角色的增益包络与每条目标轨的合并增益。
+
+    返回 {"gains": 目标轨合并增益, "winners": 目标轨每采样主导角色序号,
+          "roles": 目标轨对应的角色列表, "role_gains": 角色各自包络}。
+    控制信号始终从工程 0 点计算；同一角色内重复归组的轨道只算一次；
+    post（处理后）角色在其依赖的角色全部算完后才取控制信号。
+    """
+    tracks = {track.id: track for track in project.tracks}
+    handover_frames = int(round(float(scheme.get("handover_sec", 0.05)) * sr))
+    mode = scheme.get("combine_mode", "strongest")
+    role_gains: dict[str, np.ndarray] = {}
+    role_triggers: dict[str, np.ndarray] = {}
+    target_entries: dict[str, list[tuple[dict, np.ndarray, np.ndarray]]] = {}
+    target_gains: dict[str, np.ndarray] = {}
+    target_winners: dict[str, np.ndarray] = {}
+    entry_roles: dict[str, list[dict]] = {}
+
+    for role in _topological_roles(scheme):
+        # 同一来源重复归组只取一次，不会多压一次。
+        control_ids = list(dict.fromkeys(role.get("control_track_ids", [])))
+        control_bus = np.zeros((envelope_frames, 2), dtype=np.float64)
+        for track_id in control_ids:
+            track = tracks.get(track_id)
+            if track is None:
+                continue
+            bus = _render_track_bus(
+                project, track, get_source, 0, envelope_frames, sr, 0, envelope_frames
+            )
+            if role.get("tap") == "post" and track_id in target_gains:
+                # 处理后取数：读到的是该轨被先前角色压低后的声音。
+                bus = bus * target_gains[track_id][:, None]
+            control_bus += bus
+        preset = {
+            "threshold_db": scheme["threshold_db"],
+            "depth_db": role["depth_db"],
+            "attack_sec": scheme["attack_sec"],
+            "hold_sec": scheme["hold_sec"],
+            "release_sec": scheme["release_sec"],
+        }
+        envelope, trigger = _ducking_gain_and_trigger(control_bus, preset, sr)
+        role_gains[role["id"]] = envelope
+        role_triggers[role["id"]] = trigger
+        for target_id in dict.fromkeys(role.get("target_track_ids", [])):
+            entries = target_entries.setdefault(target_id, [])
+            entries.append((role, envelope, trigger))
+            gain, winner = _combine_role_gains(entries, mode, handover_frames)
+            target_gains[target_id] = gain
+            target_winners[target_id] = winner
+            entry_roles[target_id] = [item[0] for item in entries]
+
+    return {
+        "gains": target_gains,
+        "winners": target_winners,
+        "roles": entry_roles,
+        "role_gains": role_gains,
+        "role_triggers": role_triggers,
+    }
+
+
+def analyze_ducking(project: Project) -> dict:
+    """汇总所有方案的控制关系，供确认前检查取数点与相互控制环。"""
+    track_names = {track.id: track.name for track in project.tracks}
+    report = {"schemes": []}
+    for scheme in (project.ducking or {}).get("schemes", []):
+        deps = _role_dependencies(scheme)
+        cycle = _find_cycle(deps)
+        names = {role["id"]: role.get("name", role["id"]) for role in scheme.get("roles", [])}
+        roles = []
+        for role in scheme.get("roles", []):
+            tap = role.get("tap", "pre")
+            roles.append({
+                "id": role["id"],
+                "name": role.get("name", role["id"]),
+                "tap": tap,
+                "tap_label": "处理后（被压低后的声音）" if tap == "post" else "处理前（原始声音）",
+                "control_tracks": [
+                    {"id": tid, "name": track_names.get(tid, "（轨道已删除）")}
+                    for tid in role.get("control_track_ids", [])
+                ],
+                "target_tracks": [
+                    {"id": tid, "name": track_names.get(tid, "（轨道已删除）")}
+                    for tid in role.get("target_track_ids", [])
+                ],
+                "depends_on": [
+                    {"id": rid, "name": names.get(rid, rid)}
+                    for rid in sorted(deps.get(role["id"], ()))
+                ],
+            })
+        report["schemes"].append({
+            "id": scheme["id"],
+            "name": scheme.get("name", scheme["id"]),
+            "combine_mode": scheme.get("combine_mode", "strongest"),
+            "ok": cycle is None,
+            "cycle": [names.get(item, item) for item in (cycle or [])],
+            "roles": roles,
+        })
+    return report
 
 
 def render(
@@ -311,8 +564,13 @@ def render(
     # 先确定渲染区间。默认渲染整段（长度由所有素材决定，含静音/未独听轨）。
     timeline_end = project.timeline_length()
     preset = project.active_ducking_preset()
+    scheme = project.active_ducking_scheme()
     duck_tail = 0.0
-    if preset:
+    if scheme:
+        duck_tail = (float(scheme.get("hold_sec", 0.0)) +
+                     float(scheme.get("release_sec", 0.0)) +
+                     float(scheme.get("handover_sec", 0.0)))
+    elif preset:
         duck_tail = max(0.0, float(preset.get("hold_sec", 0.0)) +
                         float(preset.get("release_sec", 0.0)))
     if end_time is None:
@@ -349,7 +607,17 @@ def render(
         return cache[key]
 
     duck_envelopes: dict[str, np.ndarray] = {}
-    if preset:
+    scheme_info: dict | None = None
+    if scheme:
+        # 多控制源方案：包络始终从工程 0 点计算，区间导出只切片，
+        # 交接点附近的局部导出与整段渲染逐采样一致。
+        envelope_end = max(end_time, timeline_end + duck_tail)
+        envelope_frames = int(round(envelope_end * sr))
+        scheme_info = _scheme_duck_envelopes(
+            project, scheme, get_source, envelope_frames, sr
+        )
+        duck_envelopes = scheme_info["gains"]
+    elif preset:
         control_id = project.ducking.get("control_track_id") if project.ducking else None
         target_ids = set(project.ducking.get("target_track_ids", [])) if project.ducking else set()
         control_track = next((item for item in project.tracks if item.id == control_id), None)
@@ -405,6 +673,62 @@ def render(
             item.start += start_time
             item.end += start_time
 
+    ducking_segments: list[DuckSegment] = []
+    if scheme and scheme_info:
+        roles = scheme.get("roles", [])
+        role_gains = scheme_info["role_gains"]
+        mode = scheme.get("combine_mode", "strongest")
+        present = [r for r in roles if r["id"] in role_gains]
+        if present and total_frames > 0:
+            stacked = np.stack([
+                role_gains[r["id"]][start_frame:start_frame + total_frames]
+                for r in present
+            ])
+            speaking = np.stack([
+                scheme_info["role_triggers"][r["id"]][start_frame:start_frame + total_frames]
+                for r in present
+            ])
+            any_speaking = speaking.any(axis=0)
+            any_ducking = (stacked < 0.999).any(axis=0)
+            winner = np.full(total_frames, -1, dtype=int)
+            if mode == "priority":
+                order = sorted(
+                    range(len(present)),
+                    key=lambda i: (-int(present[i].get("priority", 0)), present[i]["id"]),
+                )
+                for idx in order:
+                    take = speaking[idx] & (winner < 0)
+                    winner[take] = idx
+            else:
+                pool = np.where(speaking, stacked, np.inf)
+                winner[any_speaking] = np.argmin(pool, axis=0)[any_speaking]
+            rest = (winner < 0) & any_ducking
+            winner[rest] = np.argmin(stacked, axis=0)[rest]
+            # 压缩成“谁在控制”的连续时段；短间隙（<20ms）并入同角色。
+            seg_start: int | None = None
+            seg_role = -1
+            for i in range(total_frames + 1):
+                current = int(winner[i]) if i < total_frames else -1
+                if current != seg_role:
+                    if seg_role >= 0 and seg_start is not None:
+                        role = present[seg_role]
+                        ducking_segments.append(DuckSegment(
+                            start=start_time + seg_start / sr,
+                            end=start_time + i / sr,
+                            role_id=role["id"],
+                            role_name=role.get("name", role["id"]),
+                        ))
+                    seg_start = i if current >= 0 else None
+                    seg_role = current
+            merged: list[DuckSegment] = []
+            for seg in ducking_segments:
+                if (merged and merged[-1].role_id == seg.role_id
+                        and seg.start - merged[-1].end < 0.02):
+                    merged[-1].end = seg.end
+                else:
+                    merged.append(seg)
+            ducking_segments = merged
+
     master = bus * project.master_gain()
     peak = float(np.max(np.abs(master))) if master.size else 0.0
 
@@ -418,6 +742,7 @@ def render(
         over_count=over_count,
         over_ranges=ranges,
         ducking_ranges=ducking_ranges,
+        ducking_segments=ducking_segments,
         duration=total_frames / sr,
         start_time=start_frame / sr,
         content_end_time=content_end_time,

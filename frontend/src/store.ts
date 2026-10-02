@@ -1,6 +1,6 @@
 import { create } from "zustand";
-import type { AutomationPointData, ClipData, DuckingConfig, DuckingPreset, EffectData, ProjectData, TrackData } from "./types";
-import { defaultDucking } from "./api";
+import type { AutomationPointData, ClipData, DuckingConfig, DuckingPreset, DuckingRole, DuckingScheme, EffectData, ProjectData, TrackData } from "./types";
+import { defaultDucking, defaultRole, defaultScheme } from "./api";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
@@ -33,6 +33,15 @@ interface StudioState {
   updateDucking: (patch: Partial<DuckingConfig>) => void;
   updateDuckingPreset: (id: "a" | "b", patch: Partial<DuckingPreset>) => void;
   toggleDuckingTarget: (trackId: string) => void;
+  addScheme: () => void;
+  duplicateScheme: (schemeId: string) => void;
+  removeScheme: (schemeId: string) => void;
+  setActiveScheme: (schemeId: string | null) => void;
+  updateScheme: (schemeId: string, patch: Partial<DuckingScheme>) => void;
+  addRole: (schemeId: string) => void;
+  updateRole: (schemeId: string, roleId: string, patch: Partial<DuckingRole>) => void;
+  removeRole: (schemeId: string, roleId: string) => void;
+  toggleRoleTrack: (schemeId: string, roleId: string, key: "control_track_ids" | "target_track_ids", trackId: string) => void;
   addClip: (trackId: string, source: string, duration: number) => void;
   moveClip: (trackId: string, clipId: string, start: number) => void;
   trimClip: (trackId: string, clipId: string, patch: TrimPatch) => void;
@@ -64,6 +73,32 @@ function mutateTrack(project: ProjectData, trackId: string, fn: (track: TrackDat
       return next;
     }),
   };
+}
+
+function mutateDucking(state: StudioState, fn: (ducking: DuckingConfig) => void): ProjectData {
+  const ducking: DuckingConfig = {
+    ...defaultDucking(),
+    ...(state.project.ducking ?? {}),
+    schemes: (state.project.ducking?.schemes ?? []).map((scheme) => ({
+      ...scheme,
+      roles: scheme.roles.map((role) => ({
+        ...role,
+        control_track_ids: [...role.control_track_ids],
+        target_track_ids: [...role.target_track_ids],
+      })),
+    })),
+    presets: (state.project.ducking?.presets ?? defaultDucking().presets).map((p) => ({ ...p })),
+    target_track_ids: [...(state.project.ducking?.target_track_ids ?? [])],
+  };
+  fn(ducking);
+  return { ...state.project, ducking };
+}
+
+function mutateScheme(state: StudioState, schemeId: string, fn: (scheme: DuckingScheme) => void): ProjectData {
+  return mutateDucking(state, (ducking) => {
+    const scheme = ducking.schemes.find((item) => item.id === schemeId);
+    if (scheme) fn(scheme);
+  });
 }
 
 function withClip(
@@ -160,6 +195,84 @@ export const useStudio = create<StudioState>((set) => ({
         : [...ducking.target_track_ids, trackId];
       return { project: { ...state.project, ducking: { ...ducking, target_track_ids } } };
     }),
+
+  addScheme: () =>
+    set((state) => ({
+      project: mutateDucking(state, (ducking) => {
+        const id = "scheme-" + uid();
+        ducking.schemes.push(defaultScheme(id, "方案 " + (ducking.schemes.length + 1)));
+        ducking.active_scheme_id = id;
+      }),
+    })),
+
+  duplicateScheme: (schemeId) =>
+    set((state) => ({
+      project: mutateDucking(state, (ducking) => {
+        const source = ducking.schemes.find((item) => item.id === schemeId);
+        if (!source) return;
+        // 副本是完全独立的快照：之后修改任一方案互不影响。
+        const copy: DuckingScheme = JSON.parse(JSON.stringify(source));
+        copy.id = "scheme-" + uid();
+        copy.name = source.name + " 副本";
+        copy.roles = copy.roles.map((role) => ({ ...role, id: "role-" + uid() }));
+        ducking.schemes.push(copy);
+        ducking.active_scheme_id = copy.id;
+      }),
+    })),
+
+  removeScheme: (schemeId) =>
+    set((state) => ({
+      project: mutateDucking(state, (ducking) => {
+        ducking.schemes = ducking.schemes.filter((item) => item.id !== schemeId);
+        if (ducking.active_scheme_id === schemeId) ducking.active_scheme_id = null;
+      }),
+    })),
+
+  setActiveScheme: (schemeId) =>
+    set((state) => ({
+      project: mutateDucking(state, (ducking) => {
+        ducking.active_scheme_id = schemeId;
+      }),
+    })),
+
+  updateScheme: (schemeId, patch) =>
+    set((state) => ({
+      project: mutateScheme(state, schemeId, (scheme) => Object.assign(scheme, patch)),
+    })),
+
+  addRole: (schemeId) =>
+    set((state) => ({
+      project: mutateScheme(state, schemeId, (scheme) => {
+        scheme.roles.push(defaultRole("role-" + uid(), "角色 " + (scheme.roles.length + 1)));
+      }),
+    })),
+
+  updateRole: (schemeId, roleId, patch) =>
+    set((state) => ({
+      project: mutateScheme(state, schemeId, (scheme) => {
+        const role = scheme.roles.find((item) => item.id === roleId);
+        if (role) Object.assign(role, patch);
+      }),
+    })),
+
+  removeRole: (schemeId, roleId) =>
+    set((state) => ({
+      project: mutateScheme(state, schemeId, (scheme) => {
+        scheme.roles = scheme.roles.filter((item) => item.id !== roleId);
+      }),
+    })),
+
+  toggleRoleTrack: (schemeId, roleId, key, trackId) =>
+    set((state) => ({
+      project: mutateScheme(state, schemeId, (scheme) => {
+        const role = scheme.roles.find((item) => item.id === roleId);
+        if (!role) return;
+        // 同一来源重复归组只保留一次，不会多压一次。
+        role[key] = role[key].includes(trackId)
+          ? role[key].filter((id) => id !== trackId)
+          : [...role[key], trackId];
+      }),
+    })),
 
   addClip: (trackId, source, duration) =>
     set((state) => {

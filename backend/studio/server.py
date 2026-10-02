@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .audio import ExportCancelled, write_wav_atomic, waveform_peaks
-from .engine import render
+from .engine import analyze_ducking, render
 from .model import Clip, Project, Track
 from .store import ImportedMedia, Session
 
@@ -32,6 +32,7 @@ class ExportJob:
         self.over_count = 0
         self.over_ranges: list[dict] = []
         self.ducking_ranges: list[dict] = []
+        self.ducking_segments: list[dict] = []
         self._cancel = threading.Event()
 
     def request_cancel(self) -> None:
@@ -92,6 +93,11 @@ class StudioState:
             ]
             job.ducking_ranges = [
                 {"start": r.start, "end": r.end} for r in result.ducking_ranges
+            ]
+            job.ducking_segments = [
+                {"start": s.start, "end": s.end,
+                 "role_id": s.role_id, "role_name": s.role_name}
+                for s in result.ducking_segments
             ]
             write_wav_atomic(
                 job.output_path, result.mix, result.sample_rate, subtype=subtype,
@@ -174,6 +180,8 @@ def make_handler(state: StudioState):
                     self._send_json({"ok": True})
                 elif route == "/api/render/preview":
                     self._render_preview()
+                elif route == "/api/ducking/validate":
+                    self._ducking_validate()
                 elif route == "/api/export":
                     self._start_export()
                 elif route.startswith("/api/export/") and route.endswith("/cancel"):
@@ -246,7 +254,17 @@ def make_handler(state: StudioState):
                 "ducking_ranges": [
                     {"start": r.start, "end": r.end} for r in result.ducking_ranges
                 ],
+                "ducking_segments": [
+                    {"start": s.start, "end": s.end,
+                     "role_id": s.role_id, "role_name": s.role_name}
+                    for s in result.ducking_segments
+                ],
             })
+
+        def _ducking_validate(self) -> None:
+            data = self._read_json()
+            project = Project.from_dict(data) if data else state.session.project
+            self._send_json(analyze_ducking(project))
 
         def _start_export(self) -> None:
             data = self._read_json()
@@ -273,6 +291,11 @@ def make_handler(state: StudioState):
                         "ducking_ranges": [
                             {"start": r.start, "end": r.end} for r in result.ducking_ranges
                         ],
+                        "ducking_segments": [
+                            {"start": s.start, "end": s.end,
+                             "role_id": s.role_id, "role_name": s.role_name}
+                            for s in result.ducking_segments
+                        ],
                         "message": "叠加超出输出范围，确认降低增益后再导出，或勾选强制导出",
                     }, status=409)
                     return
@@ -297,6 +320,7 @@ def make_handler(state: StudioState):
                 "over_count": job.over_count,
                 "over_ranges": job.over_ranges,
                 "ducking_ranges": job.ducking_ranges,
+                "ducking_segments": job.ducking_segments,
                 "output_path": job.output_path if job.status == "done" else None,
             })
 
