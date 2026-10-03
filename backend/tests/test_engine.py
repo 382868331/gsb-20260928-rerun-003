@@ -732,7 +732,7 @@ def test_v2_strongest_role_handover_is_continuous(tmp_path):
     assert report["combine"] == "strongest"
     target = next(t for t in report["targets"] if t["track_id"] == "music")
     controllers = [r["control"] for r in target["ranges"]]
-    assert controllers[:3] == ["host", "guest", "beep"]
+    assert controllers[:3] == ["主持人", "远端嘉宾", "提示音"]
     # 主持人交给嘉宾的窗口（0.48–0.54s）音乐电平不能出现回到满电平的突变缺口。
     handover = mix[int(0.48 * sr):int(0.54 * sr)]
     assert np.max(np.abs(handover)) < 0.16
@@ -752,7 +752,7 @@ def test_v2_multiply_combines_roles_by_explicit_rule(tmp_path):
     target = next(t for t in result.ducking_report["targets"]
                   if t["track_id"] == "music")
     labels = {r["control"] for r in target["ranges"]}
-    assert "host+guest" in labels
+    assert "主持人+远端嘉宾" in labels
 
 
 def test_v2_duplicate_grouping_rejected_and_silent_control_ignored(tmp_path):
@@ -862,3 +862,47 @@ def test_v2_saved_plan_is_independent_and_reproducible(tmp_path):
     assert ids == ["plan1", "plan2"]
     plan1 = next(p for p in reopened.project.ducking["plans"] if p["id"] == "plan1")
     assert plan1["roles"][0]["depth_db"] == -12.0
+
+
+def test_v2_copied_plan_labels_are_independent_after_save(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "v2-copy-labels"), sample_rate=sr)
+    project = _multi_role_project(sess, tmp_path)
+    original_mix = render(project, sess.load_source).mix
+
+    import copy
+    plans = project.ducking["plans"]
+    copied = copy.deepcopy(plans[0])
+    copied["id"] = "plan2"
+    copied["name"] = "对照副本"
+    copied["roles"][0].update(name="主播", priority=12)
+    copied["roles"][1].update(name="连线嘉宾", priority=2)
+    project.ducking["plans"].append(copied)
+    sess.save()
+
+    reopened = Session.open(sess.root)
+    reopened_plans = reopened.project.ducking["plans"]
+    assert reopened_plans[0]["roles"][0]["id"] == "host"
+    assert reopened_plans[1]["roles"][0]["id"] != "host"
+    assert reopened_plans[1]["roles"][0]["control_track_ids"] == ["host", "silent"]
+    assert reopened_plans[1]["roles"][0]["target_track_ids"] == ["music"]
+
+    reopened.project.ducking["active_plan_id"] = "plan1"
+    original_report = render(reopened.project, reopened.load_source).ducking_report
+    original_labels = [
+        range_item["control"]
+        for target in original_report["targets"] if target["track_id"] == "music"
+        for range_item in target["ranges"]
+    ]
+    assert original_labels[:3] == ["主持人", "远端嘉宾", "提示音"]
+
+    reopened.project.ducking["active_plan_id"] = "plan2"
+    copied_report = render(reopened.project, reopened.load_source).ducking_report
+    copied_labels = [
+        range_item["control"]
+        for target in copied_report["targets"] if target["track_id"] == "music"
+        for range_item in target["ranges"]
+    ]
+    assert copied_labels[:3] == ["主播", "连线嘉宾", "提示音"]
+    assert np.allclose(render(reopened.project, reopened.load_source).mix, original_mix,
+                       atol=1e-6)

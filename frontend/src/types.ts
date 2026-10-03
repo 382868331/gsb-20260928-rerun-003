@@ -88,7 +88,7 @@ export interface DuckingTargetReport {
   audible: boolean;
   peak: number;
   min_gain: number;
-  ranges: { start: number; end: number; control: string | null }[];
+  ranges: { start: number; end: number; control: string | null; control_ids?: string[] }[];
 }
 
 export interface DuckingReport {

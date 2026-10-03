@@ -465,11 +465,16 @@ def render(
             peak = float(np.max(np.abs(ducked))) if ducked.size else 0.0
             rids = sorted(target_roles.get(tid, []), key=lambda r: (-priorities[r], r))
             if combine == "multiply":
-                role_lookup = {i: "+" .join(rid for bit_i, rid in enumerate(rids)
-                                            if code & (1 << bit_i))
-                               for i, code in enumerate(range(1 << len(rids)))}
+                owner_role_sets = {
+                    code: [rid for bit_i, rid in enumerate(rids) if code & (1 << bit_i)]
+                    for code in range(1 << len(rids))
+                }
             else:
-                role_lookup = {i: rids[i] for i in range(len(rids))}
+                owner_role_sets = {i: [rids[i]] for i in range(len(rids))}
+            role_lookup = {
+                code: "+".join(roles_by_id[rid]["name"] for rid in active_rids)
+                for code, active_rids in owner_role_sets.items()
+            }
             owner_seq = owner_ids.get(tid, np.full(total_frames, -1, dtype=np.int64))[
                 start_frame:start_frame + total_frames]
             owned_ranges = []
@@ -487,6 +492,7 @@ def render(
                             "start": (run_begin + start_frame) / sr,
                             "end": (prev + 1 + start_frame) / sr,
                             "control": role_lookup[run_owner],
+                            "control_ids": owner_role_sets[run_owner],
                         })
                         run_begin = idx
                         run_owner = owner_val
@@ -495,6 +501,7 @@ def render(
                     "start": (run_begin + start_frame) / sr,
                     "end": (prev + 1 + start_frame) / sr,
                     "control": role_lookup[run_owner],
+                    "control_ids": owner_role_sets[run_owner],
                 })
             targets_report.append({
                 "track_id": tid,

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api } from "../api";
 import { useStudio } from "../store";
-import type { DuckingConfig, DuckingConfigV2, PreviewReport } from "../types";
+import type { DuckingConfig, DuckingConfigV2, DuckingReport, DuckingTargetReport, PreviewReport } from "../types";
 
 function isV2(ducking: DuckingConfig | DuckingConfigV2 | null | undefined): ducking is DuckingConfigV2 {
   return !!ducking && (ducking as DuckingConfigV2).version === 2;
@@ -10,6 +10,15 @@ function isV2(ducking: DuckingConfig | DuckingConfigV2 | null | undefined): duck
 function peakDb(report: PreviewReport | undefined) {
   if (!report) return "—";
   return (20 * Math.log10(Math.max(report.peak, 1e-9))).toFixed(1) + " dBFS";
+}
+
+function sourceLabel(range: DuckingTargetReport["ranges"][number], report: DuckingReport) {
+  if (!range.control_ids?.length) return range.control ?? "—";
+  const currentRoles = useStudio.getState().project.ducking as DuckingConfigV2;
+  const activePlan = currentRoles.plans.find((item) => item.id === report.plan_id);
+  const names = range.control_ids.map((id) =>
+    activePlan?.roles.find((role) => role.id === id)?.name ?? "已删除角色");
+  return names.join("+");
 }
 
 function LegacyPanel() {
@@ -260,7 +269,7 @@ export function DuckingPanel() {
                 <span>最深增益 {(20 * Math.log10(Math.max(target.min_gain, 1e-9))).toFixed(1)} dB</span>
                 <div className="duck-ranges">
                   {target.ranges.slice(0, 12).map((range, i) => (
-                    <span key={i}>{range.start.toFixed(2)}–{range.end.toFixed(2)}s 由 [{range.control ?? "—"}] 控制</span>
+                    <span key={i}>{range.start.toFixed(2)}–{range.end.toFixed(2)}s 由 [{sourceLabel(range, v2Report)}] 控制</span>
                   ))}
                   {target.ranges.length > 12 && <span>另有 {target.ranges.length - 12} 段</span>}
                 </div>

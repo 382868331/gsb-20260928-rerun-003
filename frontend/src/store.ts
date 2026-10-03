@@ -312,6 +312,8 @@ export const useStudio = create<StudioState>((set) => ({
       const copy: DuckingPlan = JSON.parse(JSON.stringify(source));
       copy.id = uid();
       copy.name = source.name + "（副本）";
+      const roleIdMap = Object.fromEntries(copy.roles.map((role) => [role.id, uid()]));
+      copy.roles = copy.roles.map((role) => ({ ...role, id: roleIdMap[role.id] }));
       // 已保存方案保持不变；副本是独立快照，之后修改互不影响。
       return {
         project: {

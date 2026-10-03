@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -527,14 +528,37 @@ def _ducking_v2_from_dict(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(plans_raw, list) or not plans_raw:
         raise ValueError("多角色闪避至少要有一个方案")
     plans: list[dict[str, Any]] = []
+    used_role_ids: set[str] = set()
     for item in plans_raw:
         if not isinstance(item, dict) or not item.get("id"):
             raise ValueError("闪避方案必须是带 id 的对象")
+        raw_roles = item.get("roles", [])
+        local_role_ids = [str(raw_role.get("id", "")) for raw_role in raw_roles]
+        duplicate_role_ids = {
+            role_id for role_id in local_role_ids
+            if role_id and local_role_ids.count(role_id) > 1
+        }
+        role_id_map: dict[str, str] = {}
+        for raw_role in raw_roles:
+            old_id = str(raw_role.get("id", ""))
+            if old_id and old_id in used_role_ids and old_id not in duplicate_role_ids:
+                new_id = f"{old_id}_{uuid.uuid4().hex[:8]}"
+                role_id_map[old_id] = new_id
+                old_id = new_id
+            if old_id:
+                used_role_ids.add(old_id)
+        roles = [_normalize_role(r) for r in raw_roles]
+        if role_id_map:
+            # 兼容旧版本把方案连同角色内部编号一起复制的存档：只重写角色编号，
+            # 角色与音频轨道之间的控制/受控关系仍按该方案内原位置映射，不改声音。
+            for role in roles:
+                if role["id"] in role_id_map:
+                    role["id"] = role_id_map[role["id"]]
         plan = {
             "id": str(item["id"]),
             "name": str(item.get("name", item["id"])),
             "combine": item.get("combine", "strongest"),
-            "roles": [_normalize_role(r) for r in item.get("roles", [])],
+            "roles": roles,
         }
         validate_ducking_plan(plan)
         plan.pop("_role_order", None)
