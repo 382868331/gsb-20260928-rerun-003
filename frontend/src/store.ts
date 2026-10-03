@@ -1,6 +1,6 @@
 import { create } from "zustand";
-import type { AutomationPointData, ClipData, DuckingConfig, DuckingPreset, EffectData, ProjectData, TrackData } from "./types";
-import { defaultDucking } from "./api";
+import type { AutomationPointData, ClipData, DuckingConfig, DuckingConfigV2, DuckingPlan, DuckingPreset, DuckingRole, EffectData, ProjectData, TrackData } from "./types";
+import { defaultDucking, defaultDuckingV2, migrateDuckingToV2 } from "./api";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
@@ -33,6 +33,15 @@ interface StudioState {
   updateDucking: (patch: Partial<DuckingConfig>) => void;
   updateDuckingPreset: (id: "a" | "b", patch: Partial<DuckingPreset>) => void;
   toggleDuckingTarget: (trackId: string) => void;
+  ensureDuckingV2: () => void;
+  setActivePlan: (planId: string) => void;
+  updateActivePlan: (patch: Partial<DuckingPlan>) => void;
+  addRole: () => void;
+  updateRole: (roleId: string, patch: Partial<DuckingRole>) => void;
+  removeRole: (roleId: string) => void;
+  toggleRoleTrack: (roleId: string, trackId: string, kind: "control" | "target") => void;
+  savePlanCopy: () => void;
+  removePlan: (planId: string) => void;
   addClip: (trackId: string, source: string, duration: number) => void;
   moveClip: (trackId: string, clipId: string, start: number) => void;
   trimClip: (trackId: string, clipId: string, patch: TrimPatch) => void;
@@ -134,13 +143,17 @@ export const useStudio = create<StudioState>((set) => ({
 
   updateDucking: (patch) =>
     set((state) => {
-      const ducking = state.project.ducking ?? defaultDucking();
+      const current = state.project.ducking;
+      if (current && (current as DuckingConfigV2).version === 2) return {};
+      const ducking: DuckingConfig = (current as DuckingConfig) ?? defaultDucking();
       return { project: { ...state.project, ducking: { ...ducking, ...patch } } };
     }),
 
   updateDuckingPreset: (id, patch) =>
     set((state) => {
-      const ducking = state.project.ducking ?? defaultDucking();
+      const current = state.project.ducking;
+      if (!current || (current as DuckingConfigV2).version === 2) return {};
+      const ducking: DuckingConfig = current as DuckingConfig;
       return {
         project: {
           ...state.project,
@@ -154,11 +167,167 @@ export const useStudio = create<StudioState>((set) => ({
 
   toggleDuckingTarget: (trackId) =>
     set((state) => {
-      const ducking = state.project.ducking ?? defaultDucking();
+      const current = state.project.ducking;
+      if (!current || (current as DuckingConfigV2).version === 2) return {};
+      const ducking: DuckingConfig = current as DuckingConfig;
       const target_track_ids = ducking.target_track_ids.includes(trackId)
         ? ducking.target_track_ids.filter((id) => id !== trackId)
         : [...ducking.target_track_ids, trackId];
       return { project: { ...state.project, ducking: { ...ducking, target_track_ids } } };
+    }),
+
+  ensureDuckingV2: () =>
+    set((state) => {
+      const current = state.project.ducking;
+      if (current && (current as DuckingConfigV2).version === 2) return {};
+      const ducking: DuckingConfigV2 = current ? migrateDuckingToV2(current as DuckingConfig) : defaultDuckingV2();
+      return { project: { ...state.project, ducking } };
+    }),
+
+  setActivePlan: (planId) =>
+    set((state) => {
+      const ducking = state.project.ducking as DuckingConfigV2 | null | undefined;
+      if (!ducking || ducking.version !== 2) return {};
+      return { project: { ...state.project,
+        ducking: { ...ducking, active_plan_id: planId } } };
+    }),
+
+  updateActivePlan: (patch) =>
+    set((state) => {
+      const ducking = state.project.ducking as DuckingConfigV2 | null | undefined;
+      if (!ducking || ducking.version !== 2) return {};
+      return {
+        project: {
+          ...state.project,
+          ducking: {
+            ...ducking,
+            plans: ducking.plans.map((plan) =>
+              plan.id === ducking.active_plan_id ? { ...plan, ...patch } : plan),
+          },
+        },
+      };
+    }),
+
+  addRole: () =>
+    set((state) => {
+      const ducking = state.project.ducking as DuckingConfigV2 | null | undefined;
+      if (!ducking || ducking.version !== 2) return {};
+      const role: DuckingRole = {
+        id: uid(),
+        name: `角色 ${ducking.plans.find((p) => p.id === ducking.active_plan_id)?.roles.length ?? 0 + 1}`,
+        priority: 1,
+        control_track_ids: [],
+        target_track_ids: [],
+        source: "pre",
+        threshold_db: -25,
+        depth_db: -10,
+        attack_sec: 0.05,
+        hold_sec: 0.15,
+        release_sec: 0.6,
+      };
+      return {
+        project: {
+          ...state.project,
+          ducking: {
+            ...ducking,
+            plans: ducking.plans.map((plan) =>
+              plan.id === ducking.active_plan_id
+                ? { ...plan, roles: [...plan.roles, role] }
+                : plan),
+          },
+        },
+      };
+    }),
+
+  updateRole: (roleId, patch) =>
+    set((state) => {
+      const ducking = state.project.ducking as DuckingConfigV2 | null | undefined;
+      if (!ducking || ducking.version !== 2) return {};
+      return {
+        project: {
+          ...state.project,
+          ducking: {
+            ...ducking,
+            plans: ducking.plans.map((plan) =>
+              plan.id !== ducking.active_plan_id ? plan : {
+                ...plan,
+                roles: plan.roles.map((role) =>
+                  role.id === roleId ? { ...role, ...patch } : role),
+              }),
+          },
+        },
+      };
+    }),
+
+  removeRole: (roleId) =>
+    set((state) => {
+      const ducking = state.project.ducking as DuckingConfigV2 | null | undefined;
+      if (!ducking || ducking.version !== 2) return {};
+      return {
+        project: {
+          ...state.project,
+          ducking: {
+            ...ducking,
+            plans: ducking.plans.map((plan) =>
+              plan.id !== ducking.active_plan_id ? plan
+                : { ...plan, roles: plan.roles.filter((role) => role.id !== roleId) }),
+          },
+        },
+      };
+    }),
+
+  toggleRoleTrack: (roleId, trackId, kind) =>
+    set((state) => {
+      const ducking = state.project.ducking as DuckingConfigV2 | null | undefined;
+      if (!ducking || ducking.version !== 2) return {};
+      const key = kind === "control" ? "control_track_ids" : "target_track_ids";
+      return {
+        project: {
+          ...state.project,
+          ducking: {
+            ...ducking,
+            plans: ducking.plans.map((plan) =>
+              plan.id !== ducking.active_plan_id ? plan : {
+                ...plan,
+                roles: plan.roles.map((role) => {
+                  if (role.id !== roleId) return role;
+                  const list = role[key];
+                  const next = list.includes(trackId)
+                    ? list.filter((id) => id !== trackId)
+                    : [...list, trackId];
+                  return { ...role, [key]: next };
+                }),
+              }),
+          },
+        },
+      };
+    }),
+
+  savePlanCopy: () =>
+    set((state) => {
+      const ducking = state.project.ducking as DuckingConfigV2 | null | undefined;
+      if (!ducking || ducking.version !== 2) return {};
+      const source = ducking.plans.find((plan) => plan.id === ducking.active_plan_id);
+      if (!source) return {};
+      const copy: DuckingPlan = JSON.parse(JSON.stringify(source));
+      copy.id = uid();
+      copy.name = source.name + "（副本）";
+      // 已保存方案保持不变；副本是独立快照，之后修改互不影响。
+      return {
+        project: {
+          ...state.project,
+          ducking: { ...ducking, plans: [...ducking.plans, copy], active_plan_id: copy.id },
+        },
+      };
+    }),
+
+  removePlan: (planId) =>
+    set((state) => {
+      const ducking = state.project.ducking as DuckingConfigV2 | null | undefined;
+      if (!ducking || ducking.version !== 2 || ducking.plans.length <= 1) return {};
+      const plans = ducking.plans.filter((plan) => plan.id !== planId);
+      const active_plan_id = ducking.active_plan_id === planId ? plans[0].id : ducking.active_plan_id;
+      return { project: { ...state.project, ducking: { ...ducking, plans, active_plan_id } } };
     }),
 
   addClip: (trackId, source, duration) =>

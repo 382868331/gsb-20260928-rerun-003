@@ -13,7 +13,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from studio.audio import ExportCancelled, write_wav_atomic
 from studio.engine import render
-from studio.model import AutomationPoint, Clip, Project, Track, default_ducking
+from studio.model import (
+    AutomationPoint, Clip, Project, Track, default_ducking, default_ducking_v2,
+)
 from studio.store import Session
 
 
@@ -655,3 +657,208 @@ def test_ducking_presets_persist_and_original_mix_remains(tmp_path):
     reopened.project.ducking["active_preset_id"] = "off"
     original = render(reopened.project, reopened.load_source).mix
     assert np.min(original[int(0.25 * sr):int(0.35 * sr), 0]) == pytest.approx(0.283, abs=0.01)
+
+
+# ----------------------------------------------------------------------
+# 多控制源（多角色）闪避 v2
+# ----------------------------------------------------------------------
+
+def _multi_role_project(sess: Session, tmp_path):
+    """主持人/远端嘉宾交叠讲话 + 紧接的短提示音 + 一条静音控制轨。"""
+    sr = sess.project.sample_rate
+    _write_monotone(str(tmp_path / "music.wav"), np.full(sr, 0.4), sr)
+    host = np.zeros(sr, dtype=np.float32)
+    host[int(0.10 * sr):int(0.50 * sr)] = 0.8
+    guest = np.zeros(sr, dtype=np.float32)
+    guest[int(0.40 * sr):int(0.90 * sr)] = 0.8
+    beep = np.zeros(sr, dtype=np.float32)
+    beep[int(0.92 * sr):int(0.96 * sr)] = 0.9
+    silent = np.zeros(sr, dtype=np.float32)
+    import soundfile as _sf
+    music_src = sess.import_file(str(tmp_path / "music.wav"), "music.wav").relpath
+    for name, arr in [("host.wav", host), ("guest.wav", guest),
+                      ("beep.wav", beep), ("silent.wav", silent)]:
+        _sf.write(str(tmp_path / name), arr[:, None], sr, subtype="PCM_16")
+    host_src = sess.import_file(str(tmp_path / "host.wav"), "host.wav").relpath
+    guest_src = sess.import_file(str(tmp_path / "guest.wav"), "guest.wav").relpath
+    beep_src = sess.import_file(str(tmp_path / "beep.wav"), "beep.wav").relpath
+    silent_src = sess.import_file(str(tmp_path / "silent.wav"), "silent.wav").relpath
+
+    cfg = default_ducking_v2()
+    plan = cfg["plans"][0]
+    for i, item in enumerate([
+        ("host", -12.0, 10), ("guest", -6.0, 8), ("beep", -15.0, 6),
+    ]):
+        role = plan["roles"][i]
+        role["target_track_ids"] = ["music"]
+        role.update(threshold_db=-20.0, depth_db=item[1],
+                    attack_sec=0.02, hold_sec=0.05, release_sec=0.20)
+        role["priority"] = item[2]
+    plan["roles"][0]["control_track_ids"] = ["host", "silent"]  # 含一条静音轨
+    plan["roles"][1]["control_track_ids"] = ["guest"]
+    plan["roles"][2]["control_track_ids"] = ["beep"]
+
+    project = sess.project
+    project.ducking = cfg
+    project.tracks = [
+        Track("music", "背景音乐", clips=[Clip("cm", music_src, 0, 0, 1.0)]),
+        Track("host", "主持人", muted=True, clips=[Clip("ch", host_src, 0, 0, 1.0)]),
+        Track("guest", "远端嘉宾", muted=True, clips=[Clip("cg", guest_src, 0, 0, 1.0)]),
+        Track("beep", "提示音", muted=True, clips=[Clip("cb", beep_src, 0, 0, 1.0)]),
+        Track("silent", "静音轨", muted=True, clips=[Clip("cs", silent_src, 0, 0, 1.0)]),
+    ]
+    return project
+
+
+def test_v2_strongest_role_handover_is_continuous(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "v2-handover"), sample_rate=sr)
+    project = _multi_role_project(sess, tmp_path)
+    result = render(project, sess.load_source)
+    mix = result.mix[:, 0]
+
+    # 只有主持人：压 12dB；与 v1 口径一致（居中声像 1/√2），约 0.071。
+    assert np.max(np.abs(mix[int(0.30 * sr):int(0.38 * sr)])) == pytest.approx(0.071, abs=0.015)
+    # 交叠区由压得更深的主持人主导，而不是被较浅的嘉宾“放回去”。
+    overlap = mix[int(0.44 * sr):int(0.48 * sr)]
+    assert np.max(np.abs(overlap)) == pytest.approx(0.071, abs=0.02)
+    # 主持人停后嘉宾仍在讲，音乐保持被压低状态，不出现回到满电平的缺口。
+    assert np.max(np.abs(mix[int(0.52 * sr):int(0.58 * sr)])) < 0.11
+    # 紧接的短提示音压得更深 15dB。
+    assert np.max(np.abs(mix[int(0.945 * sr):int(0.958 * sr)])) == pytest.approx(0.0503, abs=0.015)
+
+    # 交接点逐采样连续：增益包络没有跳变。
+    report = result.ducking_report
+    assert report["combine"] == "strongest"
+    target = next(t for t in report["targets"] if t["track_id"] == "music")
+    controllers = [r["control"] for r in target["ranges"]]
+    assert controllers[:3] == ["host", "guest", "beep"]
+    # 主持人交给嘉宾的窗口（0.48–0.54s）音乐电平不能出现回到满电平的突变缺口。
+    handover = mix[int(0.48 * sr):int(0.54 * sr)]
+    assert np.max(np.abs(handover)) < 0.16
+    assert np.min(np.abs(handover)) >= 0.0
+
+
+def test_v2_multiply_combines_roles_by_explicit_rule(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "v2-multiply"), sample_rate=sr)
+    project = _multi_role_project(sess, tmp_path)
+    plan = project.ducking["plans"][0]
+    plan["combine"] = "multiply"
+    result = render(project, sess.load_source)
+    mix = result.mix[:, 0]
+    # 交叠区两角色共同作用：0.4 * .251 * .501 / √2 ≈ 0.0356。
+    assert np.max(np.abs(mix[int(0.44 * sr):int(0.46 * sr)])) == pytest.approx(0.0356, abs=0.01)
+    target = next(t for t in result.ducking_report["targets"]
+                  if t["track_id"] == "music")
+    labels = {r["control"] for r in target["ranges"]}
+    assert "host+guest" in labels
+
+
+def test_v2_duplicate_grouping_rejected_and_silent_control_ignored(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "v2-dup"), sample_rate=sr)
+    project = _multi_role_project(sess, tmp_path)
+    # 同一控制轨被第二个角色再次归入并压同一目标：必须拒绝而不是多压一次。
+    project.ducking["plans"][0]["roles"][1]["control_track_ids"] = ["host", "host"]
+    with pytest.raises(ValueError, match="重复"):
+        Project.from_dict(project.to_dict())
+
+
+def test_v2_slice_export_matches_full_render_at_handover(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "v2-slice"), sample_rate=sr)
+    project = _multi_role_project(sess, tmp_path)
+    full = render(project, sess.load_source).mix
+    part = render(project, sess.load_source, start_time=0.40, end_time=1.00).mix
+    expected = full[int(0.40 * sr):int(1.00 * sr)]
+    assert part.shape == expected.shape
+    assert np.allclose(part, expected, atol=1e-6)
+
+
+def test_v2_pre_post_control_source_and_cycle_rejection(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "v2-chain"), sample_rate=sr)
+    _write_monotone(str(tmp_path / "bgm.wav"), np.full(sr, 0.3), sr)
+    _write_monotone(str(tmp_path / "bed.wav"), np.full(sr, 0.3), sr)
+    voice = np.zeros(sr, dtype=np.float32)
+    voice[int(0.2 * sr):int(0.6 * sr)] = 0.8
+    import soundfile as _sf
+    _sf.write(str(tmp_path / "a.wav"), voice[:, None], sr, subtype="PCM_16")
+    bgm_src = sess.import_file(str(tmp_path / "bgm.wav"), "bgm.wav").relpath
+    bed_src = sess.import_file(str(tmp_path / "bed.wav"), "bed.wav").relpath
+    a_src = sess.import_file(str(tmp_path / "a.wav"), "a.wav").relpath
+
+    def config(source):
+        return {"version": 2, "active_plan_id": "p", "plans": [{
+            "id": "p", "name": "p", "combine": "strongest", "roles": [
+                {"id": "host", "name": "h", "priority": 10,
+                 "control_track_ids": ["a"], "target_track_ids": ["bgm"],
+                 "source": "pre", "threshold_db": -20.0, "depth_db": -20.0,
+                 "attack_sec": 0.01, "hold_sec": 0.02, "release_sec": 0.10},
+                {"id": "chain", "name": "c", "priority": 5,
+                 "control_track_ids": ["bgm"], "target_track_ids": ["bed"],
+                 "source": source, "threshold_db": -20.0, "depth_db": -10.0,
+                 "attack_sec": 0.01, "hold_sec": 0.02, "release_sec": 0.10},
+            ]}]}
+
+    project = sess.project
+    project.tracks = [
+        Track("bgm", clips=[Clip("cbgm", bgm_src, 0, 0, 1.0)]),
+        Track("bed", clips=[Clip("cbed", bed_src, 0, 0, 1.0)]),
+        Track("a", muted=True, clips=[Clip("ca", a_src, 0, 0, 1.0)]),
+    ]
+
+    # 处理前信号：bgm 原始电平 0.3 一直超阈值，bed 全程被压低。
+    project.ducking = config("pre")
+    pre_mix = render(project, sess.load_source).mix[:, 0]
+    assert np.max(np.abs(pre_mix[int(0.05 * sr):int(0.10 * sr)])) == pytest.approx(
+        (0.3 + 0.3 * 10 ** (-10 / 20)) / np.sqrt(2), abs=0.03)
+
+    # 处理后信号：讲话期间 bgm 已被压到约 0.03（低于 -20dB 阈值），
+    # 级联不再触发 bed；讲话外 bgm 恢复时 bed 才被压低。
+    project.ducking = config("post")
+    post = render(project, sess.load_source)
+    post_mix = post.mix[:, 0]
+    assert np.max(np.abs(post_mix[int(0.30 * sr):int(0.40 * sr)])) == pytest.approx(
+        (0.3 * 10 ** (-20 / 20) + 0.3) / np.sqrt(2), abs=0.03)
+    role_sources = {r["id"]: r["source"] for r in post.ducking_report["roles"]}
+    assert role_sources == {"host": "pre", "chain": "post"}
+
+    # 相互控制（post 环）无法解释：加载与渲染都必须失败，不允许只算一半。
+    cycle = config("post")
+    cycle["plans"][0]["roles"][0].update(
+        control_track_ids=["bed"], target_track_ids=["bgm"], source="post")
+    with pytest.raises(ValueError, match="相互控制环"):
+        Project.from_dict({**project.to_dict(), "ducking": cycle})
+    project.ducking = cycle
+    with pytest.raises(ValueError, match="相互控制环"):
+        render(project, sess.load_source)
+
+
+def test_v2_saved_plan_is_independent_and_reproducible(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "v2-save"), sample_rate=sr)
+    project = _multi_role_project(sess, tmp_path)
+    first = render(project, sess.load_source).mix
+    # 复制一份方案再修改：已保存方案的关系不能随新方案改变。
+    import copy
+    plans = project.ducking["plans"]
+    saved = copy.deepcopy(plans[0])
+    saved["id"] = "plan2"
+    saved["name"] = "方案 2"
+    saved["roles"][0]["depth_db"] = -3.0
+    plans.append(saved)
+    project.ducking["active_plan_id"] = "plan2"
+    assert plans[0]["roles"][0]["depth_db"] == -12.0
+    project.ducking["active_plan_id"] = "plan1"
+
+    sess.save()
+    reopened = Session.open(sess.root)
+    again = render(reopened.project, reopened.load_source).mix
+    assert again.shape == first.shape
+    assert np.allclose(first, again, atol=1e-6)
+    ids = [p["id"] for p in reopened.project.ducking["plans"]]
+    assert ids == ["plan1", "plan2"]
+    plan1 = next(p for p in reopened.project.ducking["plans"] if p["id"] == "plan1")
+    assert plan1["roles"][0]["depth_db"] == -12.0

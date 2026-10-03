@@ -26,7 +26,10 @@ from typing import Callable
 
 import numpy as np
 
-from .model import AutomationPoint, Clip, Project, Track, _db_to_gain
+from .model import (
+    AutomationPoint, Clip, Project, Track, _db_to_gain, active_ducking_plan_v2,
+    validate_ducking_plan,
+)
 
 
 SourceLoader = Callable[[str], np.ndarray]
@@ -56,6 +59,8 @@ class RenderResult:
     # 内容（片段/所选区间）本身的结束时间，与效果尾音的结束时间区分开。
     content_end_time: float = 0.0   # 请求区间的结束（片段本身到这里为止）
     tail_end_time: float = 0.0      # 实际渲染结束（含自然衰减尾音）
+    # 多角色闪避核对报告：每个受控轨的实际峰值、压低时段与当时的控制角色。
+    ducking_report: dict | None = None
 
 
 class RenderError(Exception):
@@ -311,12 +316,16 @@ def render(
     # 先确定渲染区间。默认渲染整段（长度由所有素材决定，含静音/未独听轨）。
     timeline_end = project.timeline_length()
     preset = project.active_ducking_preset()
+    plan_v2 = active_ducking_plan_v2(project.ducking) if project.ducking else None
     duck_tail = 0.0
     if preset:
         duck_tail = max(0.0, float(preset.get("hold_sec", 0.0)) +
                         float(preset.get("release_sec", 0.0)))
+    if plan_v2:
+        for role in plan_v2["roles"]:
+            duck_tail = max(duck_tail, float(role["hold_sec"]) + float(role["release_sec"]))
     if end_time is None:
-        default_end = timeline_end + duck_tail if preset else timeline_end
+        default_end = timeline_end + duck_tail if (preset or plan_v2) else timeline_end
         end_time = default_end if duration is None else start_time + duration
     start_time = max(0.0, float(start_time))
     end_time = max(start_time, float(end_time))
@@ -349,7 +358,164 @@ def render(
         return cache[key]
 
     duck_envelopes: dict[str, np.ndarray] = {}
-    if preset:
+    ducking_report: dict | None = None
+    if plan_v2:
+        track_ids = {track.id for track in project.tracks}
+        plan_copy = {"id": plan_v2["id"], "name": plan_v2["name"],
+                     "combine": plan_v2["combine"],
+                     "roles": [dict(role) for role in plan_v2["roles"]]}
+        # 渲染前再次校验：无法成立（相互控制环/重复归组/引用缺失）的关系
+        # 直接失败，绝不只悄悄计算其中一部分。
+        validate_ducking_plan(plan_copy, track_ids)
+        role_order = plan_copy["_role_order"]
+        roles_by_id = {role["id"]: role for role in plan_copy["roles"]}
+
+        envelope_end = max(end_time, timeline_end + duck_tail)
+        envelope_frames = int(round(envelope_end * sr))
+
+        # 每条轨道“处理前”的声音：素材 -> 效果链 -> 推子/声像，但不含任何闪避。
+        # 控制轨静音时仍然按位置/裁切/增益参与电平分析（沿用既有约定）。
+        raw_buses: dict[str, np.ndarray] = {}
+        needed = set()
+        for role in plan_copy["roles"]:
+            needed.update(role["control_track_ids"])
+            needed.update(role["target_track_ids"])
+        for track_id in needed:
+            track = next((item for item in project.tracks if item.id == track_id), None)
+            if track is not None:
+                raw_buses[track_id] = _render_track_bus(
+                    project, track, get_source, 0, envelope_frames, sr, 0, envelope_frames,
+                )
+
+        combine = plan_copy["combine"]
+        # 已作用到各受控轨上的累计增益，与每个角色自己的包络；
+        # post 角色听到的是 raw * 此前累计增益，pre 角色只听 raw。
+        combined: dict[str, np.ndarray] = {}
+        role_envelopes: dict[str, np.ndarray] = {}
+        priorities = {rid: int(roles_by_id[rid]["priority"]) for rid in role_order}
+        for rid in role_order:
+            role = roles_by_id[rid]
+            # 同一角色的多条控制轨取电平最大值；轨 id 已去重，不会多压一次。
+            levels = []
+            for cid in role["control_track_ids"]:
+                if cid not in raw_buses:
+                    continue
+                raw = raw_buses[cid]
+                if role["source"] == "post" and cid in combined:
+                    # 明确使用“处理后”的声音：乘上此前已作用到该轨的闪避增益。
+                    raw = raw * combined[cid][:, None]
+                levels.append(np.max(np.abs(raw), axis=1))
+            if levels:
+                control_level = np.maximum.reduce(levels)
+                control_bus = control_level[:, None] * np.ones((1, channels))
+            else:
+                control_bus = np.zeros((envelope_frames, channels))
+            envelope = _ducking_gain_envelope(control_bus, role, sr)
+            role_envelopes[rid] = envelope
+            for target_id in role["target_track_ids"]:
+                if target_id not in raw_buses:
+                    continue
+                current = combined.get(target_id)
+                if current is None:
+                    combined[target_id] = envelope.copy()
+                elif combine == "multiply":
+                    # 明确的共同作用规则：线性增益相乘（dB 压低量相加）。
+                    combined[target_id] = current * envelope
+                else:
+                    # 由较强（压得更深）的一方逐采样主导；交接因此连续。
+                    combined[target_id] = np.minimum(current, envelope)
+        duck_envelopes = {tid: gain for tid, gain in combined.items()}
+
+        # 每个受控轨在每个采样点的“当前控制者”编号，用于来源分段报告。
+        owner_ids: dict[str, np.ndarray] = {}
+        target_roles: dict[str, list[str]] = {}
+        for rid in role_order:
+            for tid in roles_by_id[rid]["target_track_ids"]:
+                target_roles.setdefault(tid, []).append(rid)
+        for tid, rids in target_roles.items():
+            rids = sorted(rids, key=lambda r: (-priorities[r], r))
+            stack = np.stack([role_envelopes[rid] for rid in rids])
+            # 与压低时段报告口径一致：只有真正压低（>0.01 增益差）才算在作用，
+            # 避免恢复尾端的浮点残留产生空标签分段。
+            active = stack < 0.99
+            if combine == "multiply":
+                # 共同作用：用位掩码编码所有正在作用的角色，报告里再解码。
+                bit = {rid: i for i, rid in enumerate(rids)}
+                codes = np.zeros(stack.shape[1], dtype=np.int64)
+                for rid in rids:
+                    codes += active[bit[rid]].astype(np.int64) << bit[rid]
+                owner_ids[tid] = codes
+            else:
+                # 最强主导：逐采样取增益最小（压得最深）的角色；rids 已按
+                # 优先级排序，并列时 argmin 取到优先级更高者，交接连续。
+                masked = np.where(active, stack, np.inf)
+                best = np.argmin(masked, axis=0)
+                any_active = np.any(active, axis=0)
+                owner_ids[tid] = np.where(any_active, best, -1).astype(np.int64)
+
+        # 每个受控轨的实际峰值（应用闪避后、主控前）与来源分段。
+        targets_report = []
+        audible_ids = {track.id for track in project.active_tracks()}
+        for tid in sorted(duck_envelopes):
+            if tid not in raw_buses:
+                continue
+            env = duck_envelopes[tid]
+            seg = slice(start_frame, start_frame + total_frames)
+            ducked = raw_buses[tid][seg] * env[seg, None]
+            peak = float(np.max(np.abs(ducked))) if ducked.size else 0.0
+            rids = sorted(target_roles.get(tid, []), key=lambda r: (-priorities[r], r))
+            if combine == "multiply":
+                role_lookup = {i: "+" .join(rid for bit_i, rid in enumerate(rids)
+                                            if code & (1 << bit_i))
+                               for i, code in enumerate(range(1 << len(rids)))}
+            else:
+                role_lookup = {i: rids[i] for i in range(len(rids))}
+            owner_seq = owner_ids.get(tid, np.full(total_frames, -1, dtype=np.int64))[
+                start_frame:start_frame + total_frames]
+            owned_ranges = []
+            active = np.flatnonzero(owner_seq >= 0)
+            if active.size:
+                gap = max(64, sr // 20)
+                run_begin = int(active[0])
+                run_owner = int(owner_seq[run_begin])
+                prev = int(active[0])
+                for idx in active[1:]:
+                    idx = int(idx)
+                    owner_val = int(owner_seq[idx])
+                    if idx - prev > gap or owner_val != run_owner:
+                        owned_ranges.append({
+                            "start": (run_begin + start_frame) / sr,
+                            "end": (prev + 1 + start_frame) / sr,
+                            "control": role_lookup[run_owner],
+                        })
+                        run_begin = idx
+                        run_owner = owner_val
+                    prev = idx
+                owned_ranges.append({
+                    "start": (run_begin + start_frame) / sr,
+                    "end": (prev + 1 + start_frame) / sr,
+                    "control": role_lookup[run_owner],
+                })
+            targets_report.append({
+                "track_id": tid,
+                "audible": tid in audible_ids,
+                "peak": peak,
+                "min_gain": float(np.min(env[seg])) if total_frames else 1.0,
+                "ranges": owned_ranges,
+            })
+        ducking_report = {
+            "plan_id": plan_copy["id"],
+            "combine": combine,
+            "roles": [{"id": role["id"], "name": role["name"],
+                       "priority": role["priority"],
+                       "depth_db": role["depth_db"],
+                       "source": role["source"],
+                       "control_track_ids": role["control_track_ids"],
+                       "target_track_ids": role["target_track_ids"]}
+                      for role in plan_copy["roles"]],
+            "targets": targets_report,
+        }
+    elif preset:
         control_id = project.ducking.get("control_track_id") if project.ducking else None
         target_ids = set(project.ducking.get("target_track_ids", [])) if project.ducking else set()
         control_track = next((item for item in project.tracks if item.id == control_id), None)
@@ -396,7 +562,15 @@ def render(
         item.end += start_time
 
     ducking_ranges: list[OverRange] = []
-    if duck_envelopes:
+    if plan_v2:
+        duck_flags = np.zeros(total_frames, dtype=bool)
+        for envelope in duck_envelopes.values():
+            duck_flags |= envelope[start_frame:start_frame + total_frames] < 0.99
+        ducking_ranges, _ = _over_ranges(duck_flags, sr, max_gap_samples=max(64, sr // 20))
+        for item in ducking_ranges:
+            item.start += start_time
+            item.end += start_time
+    elif duck_envelopes:
         duck_flags = np.zeros(total_frames, dtype=bool)
         for envelope in duck_envelopes.values():
             duck_flags |= envelope[start_frame:start_frame + total_frames] < 0.999
@@ -422,4 +596,5 @@ def render(
         start_time=start_frame / sr,
         content_end_time=content_end_time,
         tail_end_time=start_frame / sr + total_frames / sr,
+        ducking_report=ducking_report,
     )

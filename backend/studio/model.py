@@ -331,6 +331,8 @@ def _ducking_from_dict(data: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(data, dict):
         raise ValueError("侧链闪避配置必须是对象")
+    if int(data.get("version", 1)) == 2 or "plans" in data:
+        return _ducking_v2_from_dict(data)
     config = default_ducking()
     config.update(data)
     control = config.get("control_track_id")
@@ -357,3 +359,206 @@ def _ducking_from_dict(data: Any) -> dict[str, Any] | None:
         normalized.append(preset)
     config["presets"] = normalized
     return config
+
+
+# ------------------------------------------------------------------
+# 多控制源（多角色）闪避方案 v2
+# ------------------------------------------------------------------
+
+_ROLE_PARAM_LIMITS = {
+    "threshold_db": (-60.0, 0.0),
+    "depth_db": (-60.0, -0.1),
+    "attack_sec": (0.0, 10.0),
+    "hold_sec": (0.0, 10.0),
+    "release_sec": (0.0, 30.0),
+}
+
+
+def default_role(role_id: str = "host", name: str = "主持人",
+                 depth_db: float = -12.0) -> dict[str, Any]:
+    return {
+        "id": role_id,
+        "name": name,
+        # 数值越大优先级越高；同强度时优先级高的角色被记为控制来源。
+        "priority": 10,
+        # 同一角色可以由多条控制音轨共同触发；重复 id 只算一次。
+        "control_track_ids": [],
+        "target_track_ids": [],
+        # pre = 用该轨被闪避前的声音做控制；post = 用被其他角色压低后的声音。
+        "source": "pre",
+        "threshold_db": -25.0,
+        "depth_db": depth_db,
+        "attack_sec": 0.05,
+        "hold_sec": 0.15,
+        "release_sec": 0.60,
+    }
+
+
+def default_ducking_v2() -> dict[str, Any]:
+    plan = {
+        "id": "plan1",
+        "name": "方案 1",
+        # strongest = 同一时刻由压得更深（更强）的角色主导，交接时逐采样取更弱者；
+        # multiply = 各角色增益按规则相乘（dB 深度相加）共同作用。
+        "combine": "strongest",
+        "roles": [
+            default_role("host", "主持人", -12.0),
+            default_role("guest", "远端嘉宾", -9.0),
+            default_role("beep", "提示音", -15.0),
+        ],
+    }
+    plan["roles"][1]["priority"] = 8
+    plan["roles"][2]["priority"] = 6
+    return {
+        "version": 2,
+        "active_plan_id": "plan1",
+        "plans": [plan],
+    }
+
+
+def _normalize_role(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict) or not data.get("id"):
+        raise ValueError("闪避角色必须是带 id 的对象")
+    role_id = str(data["id"])
+    role = default_role(role_id)
+    allowed = set(role.keys()) | {"id", "name", "priority"}
+    for key, value in data.items():
+        if key in allowed:
+            role[key] = value
+    role["id"] = role_id
+    role["name"] = str(role["name"])
+    role["priority"] = int(role["priority"])
+    if role["source"] not in ("pre", "post"):
+        raise ValueError(f"角色 {role_id} 的控制信号来源必须是 pre(处理前) 或 post(处理后)")
+    for key, value in list(role.items()):
+        if key in _ROLE_PARAM_LIMITS:
+            low, high = _ROLE_PARAM_LIMITS[key]
+            role[key] = min(high, max(low, float(value)))
+    controls = role.get("control_track_ids", [])
+    targets = role.get("target_track_ids", [])
+    if not isinstance(controls, list) or not isinstance(targets, list):
+        raise ValueError(f"角色 {role_id} 的控制轨/受控轨必须是列表")
+    # 同一角色内重复归入同一控制轨只保留一次，绝不因重复归组多压一次。
+    role["control_track_ids"] = list(dict.fromkeys(str(item) for item in controls))
+    role["target_track_ids"] = list(dict.fromkeys(str(item) for item in targets))
+    return role
+
+
+def validate_ducking_plan(plan: dict[str, Any],
+                          track_ids: set[str] | None = None) -> None:
+    """校验多角色方案内部关系是否成立。
+
+    无法成立的关系直接报错，而不是悄悄只计算其中一部分：
+      1. 同一控制轨在两个角色中重复出现且这两个角色压同一受控轨——
+         multiply 下会被多压一次，strongest 下来源也无法唯一解释，故拒绝；
+      2. 角色使用“处理后(post)”信号时，沿 post 依赖形成环（含自身
+         既控制又受控的相互控制）无法解释求值顺序，拒绝；
+      3. 引用不存在的轨道时拒绝。
+    """
+    roles = plan.get("roles", [])
+    role_ids = [r["id"] for r in roles]
+    if len(role_ids) != len(set(role_ids)):
+        raise ValueError("闪避角色 id 重复")
+    if plan.get("combine") not in ("strongest", "multiply"):
+        raise ValueError("角色合成方式必须是 strongest 或 multiply")
+
+    def known(track_id: str) -> None:
+        if track_ids is not None and track_id not in track_ids:
+            raise ValueError(f"闪避关系引用了不存在的轨道 {track_id}")
+
+    # 控制轨 -> 作用到它身上的角色（该角色的目标里含此轨）。
+    controllers_of: dict[str, list[str]] = {}
+    control_owner: dict[str, str] = {}
+    for role in roles:
+        for target in role["target_track_ids"]:
+            known(target)
+            controllers_of.setdefault(target, []).append(role["id"])
+        for control in role["control_track_ids"]:
+            known(control)
+            if control in control_owner:
+                other = control_owner[control]
+                shared = set(role["target_track_ids"]) & set(
+                    next(r for r in roles if r["id"] == other)["target_track_ids"])
+                if shared:
+                    raise ValueError(
+                        f"控制轨 {control} 同时归入角色 {other} 与 {role['id']} "
+                        f"并共同压低 {sorted(shared)}，同一来源会被重复计算")
+            else:
+                control_owner[control] = role["id"]
+
+    # post 依赖边：角色 A 用处理后信号听轨 t，而角色 B 压 t，则 B 必须先求值。
+    by_id = {r["id"]: r for r in roles}
+    deps: dict[str, set[str]] = {r["id"]: set() for r in roles}
+    for rid in role_ids:
+        role = by_id[rid]
+        if role["source"] != "post":
+            continue
+        for control in role["control_track_ids"]:
+            for other in controllers_of.get(control, []):
+                deps[rid].add(other)
+    # Kahn 拓扑排序：无法排完即存在相互控制环。
+    # deps[x] = x 求值前必须先完成的角色；从没有依赖的角色开始。
+    dependents: dict[str, set[str]] = {rid: set() for rid in deps}
+    indegree = {rid: len(prereq) for rid, prereq in deps.items()}
+    for rid, prereq in deps.items():
+        for prereq_id in prereq:
+            dependents.setdefault(prereq_id, set()).add(rid)
+    queue = sorted(rid for rid, degree in indegree.items() if degree == 0)
+    ordered: list[str] = []
+    while queue:
+        rid = queue.pop(0)
+        ordered.append(rid)
+        for other in sorted(dependents.get(rid, ())):
+            indegree[other] -= 1
+            if indegree[other] == 0:
+                queue.append(other)
+    if len(ordered) != len(deps):
+        cycle = sorted(set(deps) - set(ordered))
+        raise ValueError(
+            "处理后(post)控制关系形成无法解释的相互控制环: "
+            + " -> ".join(cycle) + "（请把环上至少一条关系改为处理前 pre）")
+    # 供引擎按拓扑顺序求值。
+    plan["_role_order"] = ordered
+
+
+def _ducking_v2_from_dict(data: dict[str, Any]) -> dict[str, Any]:
+    default = default_ducking_v2()
+    plans_raw = data.get("plans")
+    if not isinstance(plans_raw, list) or not plans_raw:
+        raise ValueError("多角色闪避至少要有一个方案")
+    plans: list[dict[str, Any]] = []
+    for item in plans_raw:
+        if not isinstance(item, dict) or not item.get("id"):
+            raise ValueError("闪避方案必须是带 id 的对象")
+        plan = {
+            "id": str(item["id"]),
+            "name": str(item.get("name", item["id"])),
+            "combine": item.get("combine", "strongest"),
+            "roles": [_normalize_role(r) for r in item.get("roles", [])],
+        }
+        validate_ducking_plan(plan)
+        plan.pop("_role_order", None)
+        plans.append(plan)
+    plan_ids = [p["id"] for p in plans]
+    if len(plan_ids) != len(set(plan_ids)):
+        raise ValueError("闪避方案 id 重复")
+    active_id = str(data.get("active_plan_id", plans[0]["id"]))
+    if active_id not in plan_ids:
+        raise ValueError("当前闪避方案不存在")
+    config = {
+        "version": 2,
+        "active_plan_id": active_id,
+        "plans": plans,
+    }
+    return config
+
+
+def active_ducking_plan_v2(ducking: dict[str, Any]) -> dict[str, Any] | None:
+    """返回当前启用的多角色方案；未启用/旧版配置返回 None。"""
+    if not ducking or int(ducking.get("version", 1)) != 2:
+        return None
+    active_id = ducking.get("active_plan_id")
+    for plan in ducking.get("plans", []):
+        if plan.get("id") == active_id:
+            return plan
+    return None

@@ -246,6 +246,7 @@ def make_handler(state: StudioState):
                 "ducking_ranges": [
                     {"start": r.start, "end": r.end} for r in result.ducking_ranges
                 ],
+                "ducking_report": result.ducking_report,
             })
 
         def _start_export(self) -> None:
@@ -273,6 +274,7 @@ def make_handler(state: StudioState):
                         "ducking_ranges": [
                             {"start": r.start, "end": r.end} for r in result.ducking_ranges
                         ],
+                        "ducking_report": result.ducking_report,
                         "message": "叠加超出输出范围，确认降低增益后再导出，或勾选强制导出",
                     }, status=409)
                     return

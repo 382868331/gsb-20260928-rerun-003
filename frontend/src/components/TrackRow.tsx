@@ -15,8 +15,17 @@ export function TrackRow({ track, pixelsPerSecond, timelineWidth, anySolo }: Pro
     moveClip, trimClipLive, trimClip, removeClip, setClipAutomation,
   } = useStudio();
   const ducking = useStudio((state) => state.project.ducking);
-  const isControl = ducking?.control_track_id === track.id;
-  const isDuckTarget = ducking?.target_track_ids.includes(track.id) ?? false;
+  const v1 = ducking && (ducking as { version?: number }).version !== 2
+    ? ducking as { control_track_id?: string | null; target_track_ids?: string[] }
+    : null;
+  const v2 = ducking && (ducking as { version?: number }).version === 2
+    ? ducking as { plans: { id: string; roles: { control_track_ids: string[]; target_track_ids: string[] }[] }[]; active_plan_id: string }
+    : null;
+  const v2Plan = v2?.plans.find((plan) => plan.id === v2.active_plan_id);
+  const isControl = v1?.control_track_id === track.id
+    || !!v2Plan?.roles.some((role) => role.control_track_ids.includes(track.id));
+  const isDuckTarget = v1?.target_track_ids?.includes(track.id)
+    || !!v2Plan?.roles.some((role) => role.target_track_ids.includes(track.id));
 
   return (
     <div className={`track ${track.muted ? "track-muted" : ""} ${anySolo && !track.solo ? "track-dimmed" : ""} ${isControl ? "track-control" : ""} ${isDuckTarget ? "track-duck-target" : ""}`}>

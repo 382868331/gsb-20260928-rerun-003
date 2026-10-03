@@ -54,6 +54,52 @@ export interface DuckingConfig {
   presets: DuckingPreset[];
 }
 
+export interface DuckingRole {
+  id: string;
+  name: string;
+  priority: number;
+  control_track_ids: string[];
+  target_track_ids: string[];
+  /** pre = 用受控前的原始声音做电平分析；post = 用被其他角色压低后的声音。 */
+  source: "pre" | "post";
+  threshold_db: number;
+  depth_db: number;
+  attack_sec: number;
+  hold_sec: number;
+  release_sec: number;
+}
+
+export interface DuckingPlan {
+  id: string;
+  name: string;
+  /** strongest = 较强一方逐采样主导；multiply = 增益相乘共同作用。 */
+  combine: "strongest" | "multiply";
+  roles: DuckingRole[];
+}
+
+export interface DuckingConfigV2 {
+  version: 2;
+  active_plan_id: string;
+  plans: DuckingPlan[];
+}
+
+export interface DuckingTargetReport {
+  track_id: string;
+  audible: boolean;
+  peak: number;
+  min_gain: number;
+  ranges: { start: number; end: number; control: string | null }[];
+}
+
+export interface DuckingReport {
+  plan_id: string;
+  combine: "strongest" | "multiply";
+  roles: { id: string; name: string; priority: number; depth_db: number;
+           source: "pre" | "post"; control_track_ids: string[];
+           target_track_ids: string[] }[];
+  targets: DuckingTargetReport[];
+}
+
 export interface ProjectData {
   format: string;
   version: number;
@@ -62,7 +108,7 @@ export interface ProjectData {
   channels: number;
   master_gain_db: number;
   tracks: TrackData[];
-  ducking?: DuckingConfig | null;
+  ducking?: DuckingConfig | DuckingConfigV2 | null;
 }
 
 export interface MediaInfo {
@@ -81,4 +127,5 @@ export interface PreviewReport {
   over_count: number;
   over_ranges: { start: number; end: number }[];
   ducking_ranges: { start: number; end: number }[];
+  ducking_report?: DuckingReport | null;
 }

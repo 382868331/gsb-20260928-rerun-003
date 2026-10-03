@@ -84,6 +84,33 @@ button:hover { background: #353b4d; }
   background: #26304a; border: 1px solid #3b4d74; border-radius: 4px; padding: 1px 5px;
 }
 
+/* 多角色闪避 v2 */
+.duck-plans { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+.duck-plans label { flex-direction: row; align-items: center; gap: 3px; background: #20283a;
+  border: 1px solid #303a52; border-radius: 6px; padding: 5px 8px; color: #aebbd5; font-size: 11px; }
+.duck-plans .duck-mode-active { border-color: #6d95e8; background: #263655; }
+.duck-inline { display: inline-flex !important; flex-direction: row !important; align-items: center;
+  gap: 5px !important; }
+.duck-actions { display: flex; gap: 10px; align-items: center; margin-top: 10px;
+  color: #8b99b5; font-size: 11px; flex-wrap: wrap; }
+.duck-error-text { color: #ff8a80; }
+.duck-plan-name { margin: 6px 0; }
+.duck-plan-name input { background: #232735; color: #e6e8ee; border: 1px solid #33384a;
+  border-radius: 4px; padding: 4px 8px; width: 240px; }
+.duck-roles { display: flex; flex-direction: column; gap: 8px; }
+.duck-role { border: 1px solid #303a52; border-radius: 8px; padding: 8px 10px; background: #1d2639; }
+.duck-role-head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.duck-role-name { background: #232735; color: #e6e8ee; border: 1px solid #33384a;
+  border-radius: 4px; padding: 4px 8px; width: 150px; }
+.duck-role-head input[type="number"] { width: 64px; }
+.duck-danger-btn { color: #ff9b7a; background: transparent; border: 1px solid #6e3a2c;
+  border-radius: 5px; padding: 3px 8px; cursor: pointer; }
+.duck-role-tracks { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; }
+.duck-role-tracks > div { display: flex; flex-direction: column; gap: 4px; color: #8b99b5; font-size: 11px; }
+.duck-report-v2 { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.duck-target-report { display: flex; flex-direction: column; gap: 3px; padding: 6px 10px;
+  border-radius: 6px; background: #20283a; font-size: 11px; color: #c8d2e8; }
+
 .timeline { flex: 1; overflow: auto; padding: 0 0 24px; }
 .timeline-inner { min-width: max-content; }
 
