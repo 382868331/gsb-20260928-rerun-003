@@ -732,7 +732,8 @@ def test_v2_strongest_role_handover_is_continuous(tmp_path):
     assert report["combine"] == "strongest"
     target = next(t for t in report["targets"] if t["track_id"] == "music")
     controllers = [r["control"] for r in target["ranges"]]
-    assert controllers[:3] == ["host", "guest", "beep"]
+    # 来源标签是当前方案里人类可读的角色名，而不是内部 id。
+    assert controllers[:3] == ["主持人", "远端嘉宾", "提示音"]
     # 主持人交给嘉宾的窗口（0.48–0.54s）音乐电平不能出现回到满电平的突变缺口。
     handover = mix[int(0.48 * sr):int(0.54 * sr)]
     assert np.max(np.abs(handover)) < 0.16
@@ -752,7 +753,7 @@ def test_v2_multiply_combines_roles_by_explicit_rule(tmp_path):
     target = next(t for t in result.ducking_report["targets"]
                   if t["track_id"] == "music")
     labels = {r["control"] for r in target["ranges"]}
-    assert "host+guest" in labels
+    assert "主持人+远端嘉宾" in labels
 
 
 def test_v2_duplicate_grouping_rejected_and_silent_control_ignored(tmp_path):
@@ -862,3 +863,57 @@ def test_v2_saved_plan_is_independent_and_reproducible(tmp_path):
     assert ids == ["plan1", "plan2"]
     plan1 = next(p for p in reopened.project.ducking["plans"] if p["id"] == "plan1")
     assert plan1["roles"][0]["depth_db"] == -12.0
+
+
+def test_v2_report_labels_use_current_plan_role_names(tmp_path):
+    sr = 44100
+    sess = Session.create(str(tmp_path / "v2-labels"), sample_rate=sr)
+    project = _multi_role_project(sess, tmp_path)
+
+    def labels_of(result):
+        target = next(t for t in result.ducking_report["targets"]
+                      if t["track_id"] == "music")
+        return [r["control"] for r in target["ranges"]]
+
+    # 默认方案：标签是可读角色名而不是内部 id。
+    base = render(project, sess.load_source)
+    assert labels_of(base)[:3] == ["主持人", "远端嘉宾", "提示音"]
+
+    # 重命名当前方案角色后，来源标签立即跟随新名字。
+    plan = project.ducking["plans"][0]
+    plan["roles"][0]["name"] = "演播室主持"
+    renamed = render(project, sess.load_source)
+    assert labels_of(renamed)[:3] == ["演播室主持", "远端嘉宾", "提示音"]
+    # 只改说明与映射：相同关系下实际混音逐采样不变。
+    assert np.array_equal(base.mix, renamed.mix)
+
+    # 复制方案并分别改名/改优先级：两份方案的来源标签各自独立。
+    import copy
+    plans = project.ducking["plans"]
+    saved = copy.deepcopy(plan)
+    saved["id"] = "plan2"
+    saved["name"] = "方案 2"
+    saved["roles"][0]["name"] = "备份主持"
+    saved["roles"][1]["priority"] = 99  # 副本里改优先级不影响原方案标签
+    plans.append(saved)
+    project.ducking["active_plan_id"] = "plan2"
+    copy_result = render(project, sess.load_source)
+    assert labels_of(copy_result)[:3] == ["备份主持", "远端嘉宾", "提示音"]
+    project.ducking["active_plan_id"] = "plan1"
+    again = render(project, sess.load_source)
+    assert labels_of(again)[:3] == ["演播室主持", "远端嘉宾", "提示音"]
+
+    # 副本里删除角色后，其报告不再引用该角色；原方案不受影响。
+    del saved["roles"][2]  # 删除副本的“提示音”
+    project.ducking["active_plan_id"] = "plan2"
+    trimmed = render(project, sess.load_source)
+    assert "提示音" not in labels_of(trimmed)
+    project.ducking["active_plan_id"] = "plan1"
+
+    # 保存重开后，同一段音频对应的来源标签保持一致。
+    before = render(project, sess.load_source)
+    sess.save()
+    reopened = Session.open(sess.root)
+    after = render(reopened.project, reopened.load_source)
+    assert labels_of(after) == labels_of(before)
+    assert np.allclose(before.mix, after.mix, atol=1e-6)

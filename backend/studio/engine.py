@@ -454,6 +454,10 @@ def render(
                 owner_ids[tid] = np.where(any_active, best, -1).astype(np.int64)
 
         # 每个受控轨的实际峰值（应用闪避后、主控前）与来源分段。
+        # 来源标签使用当前方案快照里的角色名（人类可读），而不是内部 id。
+        # 名称取自正在渲染的这份方案：重命名立即生效，另存副本后各方案
+        # 互不影响，已删除的角色不会出现在方案里也就不会被引用。
+        role_names = {rid: str(roles_by_id[rid]["name"]) for rid in roles_by_id}
         targets_report = []
         audible_ids = {track.id for track in project.active_tracks()}
         for tid in sorted(duck_envelopes):
@@ -465,11 +469,11 @@ def render(
             peak = float(np.max(np.abs(ducked))) if ducked.size else 0.0
             rids = sorted(target_roles.get(tid, []), key=lambda r: (-priorities[r], r))
             if combine == "multiply":
-                role_lookup = {i: "+" .join(rid for bit_i, rid in enumerate(rids)
-                                            if code & (1 << bit_i))
+                role_lookup = {i: "+".join(role_names[rid] for bit_i, rid in enumerate(rids)
+                                           if code & (1 << bit_i))
                                for i, code in enumerate(range(1 << len(rids)))}
             else:
-                role_lookup = {i: rids[i] for i in range(len(rids))}
+                role_lookup = {i: role_names[rids[i]] for i in range(len(rids))}
             owner_seq = owner_ids.get(tid, np.full(total_frames, -1, dtype=np.int64))[
                 start_frame:start_frame + total_frames]
             owned_ranges = []
