@@ -88,7 +88,15 @@ export interface DuckingTargetReport {
   audible: boolean;
   peak: number;
   min_gain: number;
-  ranges: { start: number; end: number; control: string | null }[];
+  ranges: {
+    start: number;
+    end: number;
+    control: string | null;
+    /** 该段实际作用的控制角色 id（同名角色靠它区分；multiply 下可能多个）。 */
+    control_role_ids: string[];
+    /** 该段内实测最深压低量（dB，负值）。 */
+    depth_db: number;
+  }[];
 }
 
 export interface DuckingReport {

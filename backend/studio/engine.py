@@ -476,6 +476,26 @@ def render(
                 role_lookup = {i: role_names[rids[i]] for i in range(len(rids))}
             owner_seq = owner_ids.get(tid, np.full(total_frames, -1, dtype=np.int64))[
                 start_frame:start_frame + total_frames]
+            env_seg = env[start_frame:start_frame + total_frames]
+
+            def _range_entry(run_begin: int, run_end: int, run_owner: int) -> dict:
+                # 每段都带角色 id 列表与实测压低量：同名角色靠前端的 id 区分，
+                # 压低量是该段内实际增益的最低点（dB），供筛选与 CSV 导出。
+                if combine == "multiply":
+                    role_ids = [rid for bit_i, rid in enumerate(rids)
+                                if run_owner & (1 << bit_i)]
+                else:
+                    role_ids = [rids[run_owner]]
+                seg_gain = env_seg[run_begin:run_end]
+                min_gain = float(np.min(seg_gain)) if seg_gain.size else 1.0
+                return {
+                    "start": (run_begin + start_frame) / sr,
+                    "end": (run_end + start_frame) / sr,
+                    "control": role_lookup[run_owner],
+                    "control_role_ids": role_ids,
+                    "depth_db": 20.0 * np.log10(max(min_gain, 1e-9)),
+                }
+
             owned_ranges = []
             active = np.flatnonzero(owner_seq >= 0)
             if active.size:
@@ -487,19 +507,11 @@ def render(
                     idx = int(idx)
                     owner_val = int(owner_seq[idx])
                     if idx - prev > gap or owner_val != run_owner:
-                        owned_ranges.append({
-                            "start": (run_begin + start_frame) / sr,
-                            "end": (prev + 1 + start_frame) / sr,
-                            "control": role_lookup[run_owner],
-                        })
+                        owned_ranges.append(_range_entry(run_begin, prev + 1, run_owner))
                         run_begin = idx
                         run_owner = owner_val
                     prev = idx
-                owned_ranges.append({
-                    "start": (run_begin + start_frame) / sr,
-                    "end": (prev + 1 + start_frame) / sr,
-                    "control": role_lookup[run_owner],
-                })
+                owned_ranges.append(_range_entry(run_begin, prev + 1, run_owner))
             targets_report.append({
                 "track_id": tid,
                 "audible": tid in audible_ids,

@@ -917,3 +917,74 @@ def test_v2_report_labels_use_current_plan_role_names(tmp_path):
     after = render(reopened.project, reopened.load_source)
     assert labels_of(after) == labels_of(before)
     assert np.allclose(before.mix, after.mix, atol=1e-6)
+
+
+def test_v2_report_ranges_carry_role_ids_and_depth(tmp_path):
+    """交错交接超过一屏、同名角色、删除角色后的旧快照。"""
+    sr = 44100
+    sess = Session.create(str(tmp_path / "v2-filter"), sample_rate=sr)
+    duration = 16.0
+    frames = int(duration * sr)
+    _write_monotone(str(tmp_path / "music.wav"), np.full(frames, 0.4), sr)
+    # 两个控制源交替发声 20 次（0.4s 讲 / 0.4s 停，错开 0.4s），
+    # 交接段数远超界面一屏的 12 条。
+    voice_a = np.zeros(frames, dtype=np.float32)
+    voice_b = np.zeros(frames, dtype=np.float32)
+    for k in range(20):
+        begin = int((0.2 + 0.8 * k) * sr)
+        (voice_a if k % 2 == 0 else voice_b)[begin:begin + int(0.4 * sr)] = 0.8
+    import soundfile as _sf
+    _sf.write(str(tmp_path / "va.wav"), voice_a[:, None], sr, subtype="PCM_16")
+    _sf.write(str(tmp_path / "vb.wav"), voice_b[:, None], sr, subtype="PCM_16")
+    music_src = sess.import_file(str(tmp_path / "music.wav"), "music.wav").relpath
+    a_src = sess.import_file(str(tmp_path / "va.wav"), "va.wav").relpath
+    b_src = sess.import_file(str(tmp_path / "vb.wav"), "vb.wav").relpath
+
+    cfg = default_ducking_v2()
+    plan = cfg["plans"][0]
+    plan["roles"] = plan["roles"][:2]
+    # 两个角色使用同一个显示名：只能靠角色 id 区分来源。
+    for role, tid, depth in ((plan["roles"][0], "ctrl-a", -12.0),
+                             (plan["roles"][1], "ctrl-b", -6.0)):
+        role["name"] = "旁白"
+        role["control_track_ids"] = [tid]
+        role["target_track_ids"] = ["music"]
+        role.update(threshold_db=-20.0, depth_db=depth,
+                    attack_sec=0.02, hold_sec=0.05, release_sec=0.10)
+    project = sess.project
+    project.ducking = cfg
+    project.tracks = [
+        Track("music", "背景音乐", clips=[Clip("cm", music_src, 0, 0, duration)]),
+        Track("ctrl-a", "控制A", muted=True, clips=[Clip("ca", a_src, 0, 0, duration)]),
+        Track("ctrl-b", "控制B", muted=True, clips=[Clip("cb", b_src, 0, 0, duration)]),
+    ]
+
+    result = render(project, sess.load_source)
+    target = next(t for t in result.ducking_report["targets"]
+                  if t["track_id"] == "music")
+    ranges = target["ranges"]
+    # 交接区间完整给出，不止首屏 12 条。
+    assert len(ranges) >= 20
+    role_a, role_b = plan["roles"][0]["id"], plan["roles"][1]["id"]
+    for i, entry in enumerate(ranges):
+        # 同名角色的显示名相同，但 control_role_ids 能区分真正来源。
+        assert entry["control"] == "旁白"
+        assert entry["control_role_ids"] == [role_a if i % 2 == 0 else role_b]
+        # 压低量是该段实测最深增益（dB），与角色设定深度一致。
+        expected = -12.0 if i % 2 == 0 else -6.0
+        assert entry["depth_db"] == pytest.approx(expected, abs=0.5)
+        assert entry["end"] > entry["start"]
+
+    # 报告只追加元数据：混音结果与不加报告字段时逐采样一致。
+    again = render(project, sess.load_source)
+    assert np.array_equal(result.mix, again.mix)
+
+    # 删除角色前的检测快照保留当时名称；新检测不再引用已删角色。
+    snapshot_labels = [r["control"] for r in ranges]
+    del plan["roles"][1]
+    project.ducking = cfg
+    after_delete = render(project, sess.load_source)
+    after_target = next(t for t in after_delete.ducking_report["targets"]
+                        if t["track_id"] == "music")
+    assert all(r["control_role_ids"] == [role_a] for r in after_target["ranges"])
+    assert snapshot_labels == ["旁白"] * len(ranges)

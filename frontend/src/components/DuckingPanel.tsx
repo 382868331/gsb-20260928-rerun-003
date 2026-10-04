@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api } from "../api";
 import { useStudio } from "../store";
-import type { DuckingConfig, DuckingConfigV2, PreviewReport } from "../types";
+import type { DuckingConfig, DuckingConfigV2, DuckingReport, PreviewReport, ProjectData } from "../types";
 
 function isV2(ducking: DuckingConfig | DuckingConfigV2 | null | undefined): ducking is DuckingConfigV2 {
   return !!ducking && (ducking as DuckingConfigV2).version === 2;
@@ -10,6 +10,50 @@ function isV2(ducking: DuckingConfig | DuckingConfigV2 | null | undefined): duck
 function peakDb(report: PreviewReport | undefined) {
   if (!report) return "—";
   return (20 * Math.log10(Math.max(report.peak, 1e-9))).toFixed(1) + " dBFS";
+}
+
+/** 一次“检测混音”的只读快照：保留检测当时的角色名/轨名，
+ *  之后改名、删角色、删方案都不影响这份快照的展示与导出。 */
+interface ReportSnapshot {
+  id: number;
+  time: string;
+  planId: string;
+  planName: string;
+  combine: "strongest" | "multiply";
+  report: DuckingReport;
+  roleNames: Record<string, string>;
+  trackNames: Record<string, string>;
+}
+
+function takeSnapshot(id: number, project: ProjectData, report: DuckingReport): ReportSnapshot {
+  const ducking = project.ducking as DuckingConfigV2 | null | undefined;
+  const plan = ducking && ducking.version === 2
+    ? ducking.plans.find((item) => item.id === report.plan_id)
+    : undefined;
+  return {
+    id,
+    time: new Date().toLocaleTimeString(),
+    planId: report.plan_id,
+    planName: plan?.name ?? report.plan_id,
+    combine: report.combine,
+    report,
+    roleNames: Object.fromEntries(report.roles.map((role) => [role.id, role.name])),
+    trackNames: Object.fromEntries(project.tracks.map((track) => [track.id, track.name])),
+  };
+}
+
+function csvCell(value: string): string {
+  return /[",\n]/.test(value) ? '"' + value.replace(/"/g, '""') + '"' : value;
+}
+
+function downloadCsv(filename: string, rows: string[][]) {
+  const body = "\uFEFF" + rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
+  const url = URL.createObjectURL(new Blob([body], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 function LegacyPanel() {
@@ -175,9 +219,14 @@ function RoleCard({ role, tracks }: {
 
 export function DuckingPanel() {
   const { project, setActivePlan, updateActivePlan, addRole, savePlanCopy, removePlan } = useStudio();
-  const [report, setReport] = useState<PreviewReport | null>(null);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const [snapshots, setSnapshots] = useState<ReportSnapshot[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [filterRole, setFilterRole] = useState("");
+  const [filterTrack, setFilterTrack] = useState("");
+  const [filterStart, setFilterStart] = useState("");
+  const [filterEnd, setFilterEnd] = useState("");
   const ducking = project.ducking;
 
   if (!isV2(ducking)) {
@@ -191,17 +240,69 @@ export function DuckingPanel() {
     try {
       const next = useStudio.getState().project;
       const result = await api.preview(next);
-      setReport(result);
+      if (result.ducking_report) {
+        const snapshot = takeSnapshot(Date.now(), next, result.ducking_report);
+        setSnapshots((prev) => [...prev, snapshot]);
+        setSelectedId(snapshot.id);
+        setFilterRole("");
+        setFilterTrack("");
+        setFilterStart("");
+        setFilterEnd("");
+      }
       setMessage("检测完成：最终峰值 " + peakDb(result));
     } catch (error) {
-      setReport(null);
       setMessage((error as Error).message);
     } finally {
       setBusy(false);
     }
   }
 
-  const v2Report = report?.ducking_report;
+  const snapshot = snapshots.find((item) => item.id === selectedId) ?? snapshots[snapshots.length - 1];
+  // 角色改名后，新导出一律使用当前方案里的名字；快照里没有的角色
+  // （已删除/属于别的方案）保留检测当时的名字。
+  function displayRoleName(snap: ReportSnapshot, roleId: string): string {
+    if (snap.planId === plan.id) {
+      const current = plan.roles.find((role) => role.id === roleId);
+      if (current) return current.name;
+    }
+    return snap.roleNames[roleId] ?? roleId;
+  }
+  function displayTrackName(snap: ReportSnapshot, trackId: string): string {
+    return project.tracks.find((track) => track.id === trackId)?.name
+      ?? snap.trackNames[trackId] ?? trackId;
+  }
+
+  const startBound = filterStart.trim() === "" ? -Infinity : Number(filterStart);
+  const endBound = filterEnd.trim() === "" ? Infinity : Number(filterEnd);
+  const rows = snapshot ? snapshot.report.targets.flatMap((target) =>
+    target.ranges
+      .filter((range) =>
+        (!filterTrack || target.track_id === filterTrack) &&
+        (!filterRole || range.control_role_ids.includes(filterRole)) &&
+        range.end > startBound && range.start < endBound)
+      .map((range) => ({ target, range })),
+  ) : [];
+
+  function exportCsv() {
+    if (!snapshot) return;
+    const data = rows.map(({ target, range }) => [
+      displayTrackName(snapshot, target.track_id),
+      range.control_role_ids.map((id) => displayRoleName(snapshot, id)).join("+") || (range.control ?? "—"),
+      range.start.toFixed(3),
+      range.end.toFixed(3),
+      range.depth_db.toFixed(1),
+    ]);
+    downloadCsv("ducking-ranges.csv", [
+      ["受控音轨", "控制角色", "开始(秒)", "结束(秒)", "压低量(dB)"],
+      ...data,
+    ]);
+  }
+
+  // 同名角色在筛选下拉里用 id 后缀区分。
+  const roleOptions = snapshot ? snapshot.report.roles.map((role) => {
+    const duplicated = snapshot.report.roles.filter((item) => item.name === role.name).length > 1;
+    return { id: role.id, label: duplicated ? role.name + "（" + role.id + "）" : role.name };
+  }) : [];
 
   return (
     <section className="ducking-panel">
@@ -248,29 +349,74 @@ export function DuckingPanel() {
         <span className={message.includes("环") || message.includes("重复") ? "duck-error-text" : ""}>{message}</span>
       </div>
 
-      {v2Report && v2Report.plan_id === plan.id && (
+      {snapshots.length > 0 && snapshot && (
         <div className="duck-report-v2">
-          <strong>逐受控轨核对（合成规则：{v2Report.combine === "strongest" ? "较强主导" : "共同作用"}）</strong>
-          {v2Report.targets.map((target) => {
-            const track = project.tracks.find((t) => t.id === target.track_id);
-            return (
+          <div className="duck-snapshot-bar">
+            <strong>检测快照</strong>
+            <select value={snapshot.id} onChange={(e) => setSelectedId(Number(e.target.value))}>
+              {snapshots.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.time} · {item.planName}（{item.combine === "strongest" ? "较强主导" : "共同作用"}）
+                </option>
+              ))}
+            </select>
+            {snapshot.planId !== plan.id && (
+              <span className="duck-message">该快照属于另一方案，保留检测当时的角色名。</span>
+            )}
+          </div>
+
+          <div className="duck-filters">
+            <label>控制角色
+              <select value={filterRole} onChange={(e) => setFilterRole(e.target.value)}>
+                <option value="">全部</option>
+                {roleOptions.map((role) => (
+                  <option key={role.id} value={role.id}>{role.label}</option>
+                ))}
+              </select>
+            </label>
+            <label>受控音轨
+              <select value={filterTrack} onChange={(e) => setFilterTrack(e.target.value)}>
+                <option value="">全部</option>
+                {snapshot.report.targets.map((target) => (
+                  <option key={target.track_id} value={target.track_id}>
+                    {displayTrackName(snapshot, target.track_id)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>起始(秒)
+              <input type="number" step="0.1" value={filterStart} placeholder="不限"
+                onChange={(e) => setFilterStart(e.target.value)} /></label>
+            <label>结束(秒)
+              <input type="number" step="0.1" value={filterEnd} placeholder="不限"
+                onChange={(e) => setFilterEnd(e.target.value)} /></label>
+            <button type="button" disabled={rows.length === 0} onClick={exportCsv}>
+              导出 CSV（{rows.length} 段）
+            </button>
+          </div>
+
+          <div className="duck-ranges-full">
+            {rows.length === 0 && <span>当前筛选条件下没有交接区间。</span>}
+            {rows.map(({ target, range }, i) => (
+              <div key={i} className="duck-range-row">
+                <span>{displayTrackName(snapshot, target.track_id)}{target.audible ? "" : "（被静音/独听排除）"}</span>
+                <span>{range.start.toFixed(2)}–{range.end.toFixed(2)}s</span>
+                <span>由 [{range.control_role_ids.map((id) => displayRoleName(snapshot, id)).join("+") || (range.control ?? "—")}] 控制</span>
+                <span>压低 {range.depth_db.toFixed(1)} dB</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="duck-target-summary">
+            {snapshot.report.targets.map((target) => (
               <div key={target.track_id} className="duck-target-report">
-                <span>{track?.name ?? target.track_id}{target.audible ? "" : "（当前被静音/独听裁决排除）"}</span>
+                <span>{displayTrackName(snapshot, target.track_id)}{target.audible ? "" : "（当前被静音/独听裁决排除）"}</span>
                 <span>实际峰值 {(20 * Math.log10(Math.max(target.peak, 1e-9))).toFixed(1)} dBFS</span>
                 <span>最深增益 {(20 * Math.log10(Math.max(target.min_gain, 1e-9))).toFixed(1)} dB</span>
-                <div className="duck-ranges">
-                  {target.ranges.slice(0, 12).map((range, i) => (
-                    <span key={i}>{range.start.toFixed(2)}–{range.end.toFixed(2)}s 由 [{range.control ?? "—"}] 控制</span>
-                  ))}
-                  {target.ranges.length > 12 && <span>另有 {target.ranges.length - 12} 段</span>}
-                </div>
               </div>
-            );
-          })}
+            ))}
+          </div>
         </div>
-      )}
-      {report && (!v2Report || v2Report.plan_id !== plan.id) && (
-        <div className="duck-message">报告属于另一方案，请在当前方案重新检测。</div>
       )}
     </section>
   );

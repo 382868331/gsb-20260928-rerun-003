@@ -108,6 +108,16 @@ button:hover { background: #353b4d; }
 .duck-role-tracks { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; }
 .duck-role-tracks > div { display: flex; flex-direction: column; gap: 4px; color: #8b99b5; font-size: 11px; }
 .duck-report-v2 { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.duck-snapshot-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  color: #aebbd5; font-size: 11px; }
+.duck-filters { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.duck-filters label { min-width: 110px; }
+.duck-filters input[type="number"] { width: 90px; }
+.duck-ranges-full { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column;
+  gap: 2px; border: 1px solid #303a52; border-radius: 6px; padding: 6px 8px; background: #1a2233; }
+.duck-range-row { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11px; color: #9fc3ff; }
+.duck-range-row span:first-child { min-width: 120px; color: #aebbd5; }
+.duck-target-summary { display: flex; gap: 12px; flex-wrap: wrap; }
 .duck-target-report { display: flex; flex-direction: column; gap: 3px; padding: 6px 10px;
   border-radius: 6px; background: #20283a; font-size: 11px; color: #c8d2e8; }
 
