@@ -917,3 +917,117 @@ def test_v2_report_labels_use_current_plan_role_names(tmp_path):
     after = render(reopened.project, reopened.load_source)
     assert labels_of(after) == labels_of(before)
     assert np.allclose(before.mix, after.mix, atol=1e-6)
+
+
+def _interleaved_project(sess: Session, tmp_path, pulses: int = 20, duration: float = 3.0):
+    """主持人/嘉宾短脉冲交替讲话（远超首屏 12 段），末尾再加一个提示音。"""
+    sr = sess.project.sample_rate
+    arrays = {
+        "music": np.full(int(duration * sr), 0.4, dtype=np.float32),
+        "host": np.zeros(int(duration * sr), dtype=np.float32),
+        "guest": np.zeros(int(duration * sr), dtype=np.float32),
+        "beep": np.zeros(int(duration * sr), dtype=np.float32),
+    }
+    for i in range(pulses):
+        arr = arrays["host"] if i % 2 == 0 else arrays["guest"]
+        start = int((0.15 + 0.13 * i) * sr)
+        arr[start:start + int(0.03 * sr)] = 0.8
+    arrays["beep"][int(2.8 * sr):int(2.83 * sr)] = 0.9
+    import soundfile as _sf
+    srcs = {}
+    for name, arr in arrays.items():
+        path = str(tmp_path / f"{name}.wav")
+        _sf.write(path, arr[:, None], sr, subtype="PCM_16")
+        srcs[name] = sess.import_file(path, f"{name}.wav").relpath
+    cfg = default_ducking_v2()
+    plan = cfg["plans"][0]
+    for i, (rid, depth, prio) in enumerate([("host", -12.0, 10), ("guest", -6.0, 8), ("beep", -15.0, 6)]):
+        role = plan["roles"][i]
+        role["target_track_ids"] = ["music"]
+        role.update(threshold_db=-20.0, depth_db=depth,
+                    attack_sec=0.005, hold_sec=0.0, release_sec=0.05)
+        role["priority"] = prio
+        role["control_track_ids"] = [rid]
+    project = sess.project
+    project.ducking = cfg
+    project.tracks = [
+        Track("music", "背景音乐", clips=[Clip("cm", srcs["music"], 0, 0, duration)]),
+        Track("host", "主持人", muted=True, clips=[Clip("ch", srcs["host"], 0, 0, duration)]),
+        Track("guest", "远端嘉宾", muted=True, clips=[Clip("cg", srcs["guest"], 0, 0, duration)]),
+        Track("beep", "提示音", muted=True, clips=[Clip("cb", srcs["beep"], 0, 0, duration)]),
+    ]
+    return project
+
+
+def test_v2_report_lists_all_handover_ranges_with_depth_and_ids(tmp_path):
+    """超过一屏的交错交接全部列出，每段带控制角色 id、最深压低量与受控轨快照名。"""
+    sr = 44100
+    sess = Session.create(str(tmp_path / "v2-many"), sample_rate=sr)
+    project = _interleaved_project(sess, tmp_path)
+    result = render(project, sess.load_source)
+    target = next(t for t in result.ducking_report["targets"]
+                  if t["track_id"] == "music")
+    assert target["track_name"] == "背景音乐"
+    ranges = target["ranges"]
+    assert len(ranges) > 12  # 不能只看到首屏摘要
+    # 主持人/嘉宾严格交替，最后是提示音。
+    assert [r["control"] for r in ranges[:4]] == [
+        "主持人", "远端嘉宾", "主持人", "远端嘉宾"]
+    assert ranges[-1]["control"] == "提示音"
+    for item in ranges:
+        assert item["start"] < item["end"]
+        assert item["control_role_ids"]
+        assert item["max_reduction_db"] <= -0.1
+    depth_by_role = {}
+    for item in ranges:
+        depth_by_role.setdefault(item["control"], item["max_reduction_db"])
+    assert depth_by_role["主持人"] == pytest.approx(-12.0, abs=0.2)
+    assert depth_by_role["远端嘉宾"] == pytest.approx(-6.0, abs=0.2)
+    assert depth_by_role["提示音"] == pytest.approx(-15.0, abs=0.2)
+
+
+def test_v2_snapshot_names_freezed_rename_only_affects_new_detection(tmp_path):
+    """旧检测快照保留当时的角色/轨道名；改名后重新检测才用新名。"""
+    sr = 44100
+    sess = Session.create(str(tmp_path / "v2-freeze"), sample_rate=sr)
+    project = _interleaved_project(sess, tmp_path)
+    import copy
+    old_report = copy.deepcopy(render(project, sess.load_source).ducking_report)
+    old_mix = render(project, sess.load_source).mix
+
+    # 角色改名 + 受控轨改名：新检测使用当前名。
+    project.ducking["plans"][0]["roles"][0]["name"] = "主播"
+    project.tracks[0].name = "片花音乐"
+    new_result = render(project, sess.load_source)
+    new_report = new_result.ducking_report
+    new_target = next(t for t in new_report["targets"] if t["track_id"] == "music")
+    assert new_target["track_name"] == "片花音乐"
+    assert new_target["ranges"][0]["control"] == "主播"
+
+    # 旧快照保持检测时刻的名称，不被回头修改。
+    old_target = next(t for t in old_report["targets"] if t["track_id"] == "music")
+    assert old_target["track_name"] == "背景音乐"
+    assert old_target["ranges"][0]["control"] == "主持人"
+
+    # 两个同名角色：id 不同但名称相同，报告可读名一致且 id 可区分。
+    project.ducking["plans"][0]["roles"][1]["name"] = "主播"
+    same_name = render(project, sess.load_source).ducking_report
+    labels = {r["control"] for t in same_name["targets"] for r in t["ranges"]}
+    assert "主播" in labels
+    ids = {rid for role in same_name["roles"] if role["name"] == "主播"
+           for rid in [role["id"]]}
+    assert ids == {"host", "guest"}
+
+    # 删除角色后旧快照仍引用其旧名；当前方案重新检测不再出现该角色。
+    project.ducking["plans"][0]["roles"] = [
+        role for role in project.ducking["plans"][0]["roles"]
+        if role["id"] != "beep"
+    ]
+    trimmed = render(project, sess.load_source).ducking_report
+    trimmed_labels = {r["control"] for t in trimmed["targets"] for r in t["ranges"]}
+    assert "提示音" not in trimmed_labels
+    # 旧快照里提示音区间仍在。
+    assert "提示音" in {r["control"] for t in old_report["targets"] for r in t["ranges"]}
+
+    # 改名/删除与反复检测都是只读操作：混音逐采样不变。
+    assert np.array_equal(new_result.mix, old_mix)

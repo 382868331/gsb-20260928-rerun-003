@@ -85,10 +85,23 @@ export interface DuckingConfigV2 {
 
 export interface DuckingTargetReport {
   track_id: string;
+  /** 检测时刻该受控轨的可读名；旧检测快照保留当时名称，改名只影响新检测。 */
+  track_name?: string;
   audible: boolean;
   peak: number;
   min_gain: number;
-  ranges: { start: number; end: number; control: string | null }[];
+  ranges: DuckingHandoverRange[];
+}
+
+export interface DuckingHandoverRange {
+  start: number;
+  end: number;
+  /** 检测时刻的可读控制角色名（共同作用时以 + 连接）。 */
+  control: string | null;
+  /** 产生该交接区间的控制角色 id（共同作用时可有多个）。 */
+  control_role_ids?: string[];
+  /** 该区间内最深增益（负数 dB，如 -12.0）。 */
+  max_reduction_db?: number;
 }
 
 export interface DuckingReport {

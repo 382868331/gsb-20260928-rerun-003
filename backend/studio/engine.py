@@ -460,6 +460,7 @@ def render(
         role_names = {rid: str(roles_by_id[rid]["name"]) for rid in roles_by_id}
         targets_report = []
         audible_ids = {track.id for track in project.active_tracks()}
+        track_names = {track.id: track.name for track in project.tracks}
         for tid in sorted(duck_envelopes):
             if tid not in raw_buses:
                 continue
@@ -472,8 +473,13 @@ def render(
                 role_lookup = {i: "+".join(role_names[rid] for bit_i, rid in enumerate(rids)
                                            if code & (1 << bit_i))
                                for i, code in enumerate(range(1 << len(rids)))}
+                role_id_lookup = {
+                    i: [rid for bit_i, rid in enumerate(rids) if code & (1 << bit_i)]
+                    for i, code in enumerate(range(1 << len(rids)))
+                }
             else:
                 role_lookup = {i: role_names[rids[i]] for i in range(len(rids))}
+                role_id_lookup = {i: [rids[i]] for i in range(len(rids))}
             owner_seq = owner_ids.get(tid, np.full(total_frames, -1, dtype=np.int64))[
                 start_frame:start_frame + total_frames]
             owned_ranges = []
@@ -487,21 +493,32 @@ def render(
                     idx = int(idx)
                     owner_val = int(owner_seq[idx])
                     if idx - prev > gap or owner_val != run_owner:
+                        seg_gain = env[start_frame + run_begin:start_frame + prev + 1]
+                        max_depth = float(20.0 * np.log10(np.min(seg_gain))) if seg_gain.size else 0.0
                         owned_ranges.append({
                             "start": (run_begin + start_frame) / sr,
                             "end": (prev + 1 + start_frame) / sr,
                             "control": role_lookup[run_owner],
+                            "control_role_ids": role_id_lookup[run_owner],
+                            "max_reduction_db": round(max_depth, 3),
                         })
                         run_begin = idx
                         run_owner = owner_val
                     prev = idx
+                seg_gain = env[start_frame + run_begin:start_frame + prev + 1]
+                max_depth = float(20.0 * np.log10(np.min(seg_gain))) if seg_gain.size else 0.0
                 owned_ranges.append({
                     "start": (run_begin + start_frame) / sr,
                     "end": (prev + 1 + start_frame) / sr,
                     "control": role_lookup[run_owner],
+                    "control_role_ids": role_id_lookup[run_owner],
+                    "max_reduction_db": round(max_depth, 3),
                 })
             targets_report.append({
                 "track_id": tid,
+                # 快照检测时刻的受控轨可读名：旧检测快照保留当时名称，
+                # 之后轨道改名只影响新检测，不回头改旧快照。
+                "track_name": track_names.get(tid, tid),
                 "audible": tid in audible_ids,
                 "peak": peak,
                 "min_gain": float(np.min(env[seg])) if total_frames else 1.0,
