@@ -368,9 +368,13 @@ def _ducking_from_dict(data: Any) -> dict[str, Any] | None:
 _ROLE_PARAM_LIMITS = {
     "threshold_db": (-60.0, 0.0),
     "depth_db": (-60.0, -0.1),
+    # 可听度下限：该角色触发时，受控音轨增益最多被压到多少 dB（0=不许压低）。
+    "floor_db": (-60.0, 0.0),
     "attack_sec": (0.0, 10.0),
     "hold_sec": (0.0, 10.0),
     "release_sec": (0.0, 30.0),
+    # 允许的恢复时长上限（秒）；0 表示不限制。候选恢复超过它即被判超限。
+    "max_release_sec": (0.0, 30.0),
 }
 
 
@@ -388,9 +392,14 @@ def default_role(role_id: str = "host", name: str = "主持人",
         "source": "pre",
         "threshold_db": -25.0,
         "depth_db": depth_db,
+        # 该角色控制期间，受控音轨必须保留的可听度下限（增益 dB）。
+        # -60 表示不设限；如 -10 表示音乐最多被压到 -10dB，再低即违反要求。
+        "floor_db": -60.0,
         "attack_sec": 0.05,
         "hold_sec": 0.15,
         "release_sec": 0.60,
+        # 用户允许的恢复时长：触发结束后增益回到 0.99 的用时不得超过它（0=不限）。
+        "max_release_sec": 0.0,
     }
 
 
