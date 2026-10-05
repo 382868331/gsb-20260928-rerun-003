@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { AutomationPointData, ClipData, DuckingConfig, DuckingConfigV2, DuckingPlan, DuckingPreset, DuckingRole, EffectData, ProjectData, TrackData } from "./types";
+import type { AutomationPointData, ClipData, DuckingApproval, DuckingConfig, DuckingConfigV2, DuckingPlan, DuckingPreset, DuckingRole, EffectData, ProjectData, TrackData } from "./types";
 import { defaultDucking, defaultDuckingV2, migrateDuckingToV2 } from "./api";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -42,6 +42,8 @@ interface StudioState {
   toggleRoleTrack: (roleId: string, trackId: string, kind: "control" | "target") => void;
   savePlanCopy: () => void;
   removePlan: (planId: string) => void;
+  addDuckingApproval: (entry: DuckingApproval) => void;
+  clearDuckingApprovals: () => void;
   addClip: (trackId: string, source: string, duration: number) => void;
   moveClip: (trackId: string, clipId: string, start: number) => void;
   trimClip: (trackId: string, clipId: string, patch: TrimPatch) => void;
@@ -224,6 +226,8 @@ export const useStudio = create<StudioState>((set) => ({
         attack_sec: 0.05,
         hold_sec: 0.15,
         release_sec: 0.6,
+        floor_db: null,
+        max_recovery_sec: null,
       };
       return {
         project: {
@@ -328,6 +332,25 @@ export const useStudio = create<StudioState>((set) => ({
       const plans = ducking.plans.filter((plan) => plan.id !== planId);
       const active_plan_id = ducking.active_plan_id === planId ? plans[0].id : ducking.active_plan_id;
       return { project: { ...state.project, ducking: { ...ducking, plans, active_plan_id } } };
+    }),
+
+  addDuckingApproval: (entry) =>
+    set((state) => {
+      const ducking = state.project.ducking as DuckingConfigV2 | null | undefined;
+      if (!ducking || ducking.version !== 2) return {};
+      return {
+        project: {
+          ...state.project,
+          ducking: { ...ducking, approvals: [...(ducking.approvals ?? []), entry] },
+        },
+      };
+    }),
+
+  clearDuckingApprovals: () =>
+    set((state) => {
+      const ducking = state.project.ducking as DuckingConfigV2 | null | undefined;
+      if (!ducking || ducking.version !== 2) return {};
+      return { project: { ...state.project, ducking: { ...ducking, approvals: [] } } };
     }),
 
   addClip: (trackId, source, duration) =>

@@ -174,6 +174,14 @@ def make_handler(state: StudioState):
                     self._send_json({"ok": True})
                 elif route == "/api/render/preview":
                     self._render_preview()
+                elif route == "/api/ducking/plan":
+                    self._ducking_plan()
+                elif route == "/api/ducking/audition":
+                    self._ducking_audition()
+                elif route == "/api/ducking/approve":
+                    self._ducking_approve()
+                elif route == "/api/ducking/approvals/clear":
+                    self._ducking_clear_approvals()
                 elif route == "/api/export":
                     self._start_export()
                 elif route.startswith("/api/export/") and route.endswith("/cancel"):
@@ -248,6 +256,93 @@ def make_handler(state: StudioState):
                 ],
                 "ducking_report": result.ducking_report,
             })
+
+        @staticmethod
+        def _preview_payload(result) -> dict:
+            return {
+                "duration": result.duration,
+                "peak": result.peak,
+                "peak_before_master": result.peak_before_master,
+                "over_range": result.over_range,
+                "over_count": result.over_count,
+                "over_ranges": [
+                    {"start": r.start, "end": r.end} for r in result.over_ranges
+                ],
+                "ducking_ranges": [
+                    {"start": r.start, "end": r.end} for r in result.ducking_ranges
+                ],
+                "ducking_report": result.ducking_report,
+            }
+
+        def _ducking_plan(self) -> None:
+            """生成可比较的候选包络方案（只读，不改工程）。"""
+            from .planner import generate_plan
+            data = self._read_json()
+            project = Project.from_dict(data) if data else state.session.project
+            with state.lock:
+                snapshot = Project.from_dict(project.to_dict())
+                loader = state.session.load_source
+            self._send_json(generate_plan(snapshot, loader))
+
+        def _ducking_audition(self) -> None:
+            """试听候选包络方案：返回候选与原混音两份预览，工程保持不变。"""
+            data = self._read_json()
+            candidate = str(data.get("candidate", ""))
+            project_data = data.get("project")
+            project = (Project.from_dict(project_data) if project_data
+                       else state.session.project)
+            with state.lock:
+                snapshot = Project.from_dict(project.to_dict())
+                loader = state.session.load_source
+            original = render(snapshot, loader)
+            candidate_result = render(snapshot, loader, candidate_override=candidate)
+            self._send_json({
+                "candidate": candidate,
+                "original": self._preview_payload(original),
+                "preview": self._preview_payload(candidate_result),
+            })
+
+        def _ducking_approve(self) -> None:
+            """批准一个候选包络时间段：追加到工程（只影响该时间段）。"""
+            from .model import CANDIDATE_IDS, active_ducking_plan_v2
+            data = self._read_json()
+            candidate = str(data.get("candidate", ""))
+            if candidate not in CANDIDATE_IDS:
+                self._error(f"未知候选包络方案: {candidate!r}")
+                return
+            start = float(data.get("start", 0.0))
+            end = float(data.get("end", 0.0))
+            if not end > start >= 0.0:
+                self._error("批准时间段的起止时间非法")
+                return
+            with state.lock:
+                project = state.session.project
+                plan = active_ducking_plan_v2(project.ducking) if project.ducking else None
+                if plan is None:
+                    self._error("工程没有启用的多角色闪避方案")
+                    return
+                entry = {
+                    "plan_id": plan["id"],
+                    "candidate": candidate,
+                    "target_id": str(data.get("target_id", "")),
+                    "start": start,
+                    "end": end,
+                }
+                approvals = list(project.ducking.get("approvals", []))
+                approvals.append(entry)
+                project.ducking["approvals"] = approvals
+                # 走完整归一化校验，非法关系立即报错。
+                state.session.project = Project.from_dict(project.to_dict())
+                self._send_json({"ok": True,
+                                 "approvals": state.session.project.ducking["approvals"]})
+
+        def _ducking_clear_approvals(self) -> None:
+            with state.lock:
+                project = state.session.project
+                if project.ducking:
+                    project.ducking["approvals"] = []
+                    state.session.project = Project.from_dict(project.to_dict())
+            self._send_json({"ok": True, "approvals": []})
 
         def _start_export(self) -> None:
             data = self._read_json()

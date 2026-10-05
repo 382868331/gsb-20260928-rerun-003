@@ -264,6 +264,13 @@ def _ducking_gain_envelope(control: np.ndarray, preset: dict, sr: int) -> np.nda
     if control.size == 0:
         return np.ones(0, dtype=np.float64)
     level = np.max(np.abs(control), axis=1)
+    return _ducking_gain_from_level(level, preset, sr)
+
+
+def _ducking_gain_from_level(level: np.ndarray, preset: dict, sr: int) -> np.ndarray:
+    """由逐采样电平（ mono ）计算攻击/保持/释放后的增益包络。"""
+    if level.size == 0:
+        return np.ones(0, dtype=np.float64)
     threshold = _db_to_gain(float(preset["threshold_db"]))
     frames = level.shape[0]
     attack_frames = max(1, int(round(float(preset["attack_sec"]) * sr)))
@@ -292,6 +299,108 @@ def _ducking_gain_envelope(control: np.ndarray, preset: dict, sr: int) -> np.nda
     return gain
 
 
+@dataclass
+class V2EnvelopeContext:
+    """多角色闪避的逐采样包络计算结果（供渲染与方案规划共用）。"""
+
+    roles_by_id: dict[str, dict]
+    role_order: list[str]
+    combine: str
+    role_levels: dict[str, np.ndarray]      # 每个角色的控制电平（mono）
+    role_envelopes: dict[str, np.ndarray]   # 每个角色自身的增益包络
+    combined: dict[str, np.ndarray]         # 每个受控轨的合成增益包络
+    raw_buses: dict[str, np.ndarray]        # 每条相关轨道处理前（无闪避）的声音
+    envelope_frames: int
+    sr: int
+
+
+def compute_v2_envelopes(
+    project: Project,
+    get_source: Callable[[str], np.ndarray],
+    sr: int,
+    envelope_end: float,
+) -> V2EnvelopeContext:
+    """计算当前启用的多角色方案的全部包络。
+
+    渲染前再次校验：无法成立（相互控制环/重复归组/引用缺失）的关系
+    直接失败，绝不只悄悄计算其中一部分。
+    """
+    plan_v2 = active_ducking_plan_v2(project.ducking)
+    if plan_v2 is None:
+        raise RenderError("工程没有启用的多角色闪避方案")
+    track_ids = {track.id for track in project.tracks}
+    plan_copy = {"id": plan_v2["id"], "name": plan_v2["name"],
+                 "combine": plan_v2["combine"],
+                 "roles": [dict(role) for role in plan_v2["roles"]]}
+    validate_ducking_plan(plan_copy, track_ids)
+    role_order = plan_copy["_role_order"]
+    roles_by_id = {role["id"]: role for role in plan_copy["roles"]}
+    envelope_frames = int(round(envelope_end * sr))
+
+    # 每条轨道“处理前”的声音：素材 -> 效果链 -> 推子/声像，但不含任何闪避。
+    # 控制轨静音时仍然按位置/裁切/增益参与电平分析（沿用既有约定）。
+    raw_buses: dict[str, np.ndarray] = {}
+    needed = set()
+    for role in plan_copy["roles"]:
+        needed.update(role["control_track_ids"])
+        needed.update(role["target_track_ids"])
+    for track_id in needed:
+        track = next((item for item in project.tracks if item.id == track_id), None)
+        if track is not None:
+            raw_buses[track_id] = _render_track_bus(
+                project, track, get_source, 0, envelope_frames, sr, 0, envelope_frames,
+            )
+
+    combine = plan_copy["combine"]
+    # 已作用到各受控轨上的累计增益，与每个角色自己的包络；
+    # post 角色听到的是 raw * 此前累计增益，pre 角色只听 raw。
+    combined: dict[str, np.ndarray] = {}
+    role_envelopes: dict[str, np.ndarray] = {}
+    role_levels: dict[str, np.ndarray] = {}
+    for rid in role_order:
+        role = roles_by_id[rid]
+        # 同一角色的多条控制轨取电平最大值；轨 id 已去重，不会多压一次。
+        levels = []
+        for cid in role["control_track_ids"]:
+            if cid not in raw_buses:
+                continue
+            raw = raw_buses[cid]
+            if role["source"] == "post" and cid in combined:
+                # 明确使用“处理后”的声音：乘上此前已作用到该轨的闪避增益。
+                raw = raw * combined[cid][:, None]
+            levels.append(np.max(np.abs(raw), axis=1))
+        if levels:
+            control_level = np.maximum.reduce(levels)
+        else:
+            control_level = np.zeros(envelope_frames)
+        role_levels[rid] = control_level
+        envelope = _ducking_gain_from_level(control_level, role, sr)
+        role_envelopes[rid] = envelope
+        for target_id in role["target_track_ids"]:
+            if target_id not in raw_buses:
+                continue
+            current = combined.get(target_id)
+            if current is None:
+                combined[target_id] = envelope.copy()
+            elif combine == "multiply":
+                # 明确的共同作用规则：线性增益相乘（dB 压低量相加）。
+                combined[target_id] = current * envelope
+            else:
+                # 由较强（压得更深）的一方逐采样主导；交接因此连续。
+                combined[target_id] = np.minimum(current, envelope)
+    return V2EnvelopeContext(
+        roles_by_id=roles_by_id,
+        role_order=role_order,
+        combine=combine,
+        role_levels=role_levels,
+        role_envelopes=role_envelopes,
+        combined=combined,
+        raw_buses=raw_buses,
+        envelope_frames=envelope_frames,
+        sr=sr,
+    )
+
+
 def render(
     project: Project,
     load_source: SourceLoader,
@@ -300,6 +409,7 @@ def render(
     end_time: float | None = None,
     include_tail: bool = False,
     should_cancel: CancelFn | None = None,
+    candidate_override: str | None = None,
 ) -> RenderResult:
     """渲染工程（或其 [start_time, end_time) 区间），返回混合结果。
 
@@ -309,6 +419,9 @@ def render(
     include_tail=True 时在 end_time 之后继续渲染效果器的自然衰减尾音，
     此时 content_end_time 是所选区间本身的结束，tail_end_time 是尾音
     真正衰减完的结束；两者相等表示没有尾音或未请求尾音。
+
+    candidate_override 用于“试听候选包络方案”：不改工程，临时把当前
+    多角色方案的合成包络替换为指定候选（见 planner.py），原混音保持不变。
     """
     sr = project.sample_rate
     channels = project.channels
@@ -360,75 +473,39 @@ def render(
     duck_envelopes: dict[str, np.ndarray] = {}
     ducking_report: dict | None = None
     if plan_v2:
-        track_ids = {track.id for track in project.tracks}
-        plan_copy = {"id": plan_v2["id"], "name": plan_v2["name"],
-                     "combine": plan_v2["combine"],
-                     "roles": [dict(role) for role in plan_v2["roles"]]}
-        # 渲染前再次校验：无法成立（相互控制环/重复归组/引用缺失）的关系
-        # 直接失败，绝不只悄悄计算其中一部分。
-        validate_ducking_plan(plan_copy, track_ids)
-        role_order = plan_copy["_role_order"]
-        roles_by_id = {role["id"]: role for role in plan_copy["roles"]}
-
         envelope_end = max(end_time, timeline_end + duck_tail)
-        envelope_frames = int(round(envelope_end * sr))
+        ctx = compute_v2_envelopes(project, get_source, sr, envelope_end)
+        plan_copy = {"id": plan_v2["id"], "name": plan_v2["name"],
+                     "combine": ctx.combine,
+                     "roles": [dict(role) for role in plan_v2["roles"]]}
+        role_order = ctx.role_order
+        roles_by_id = ctx.roles_by_id
+        raw_buses = ctx.raw_buses
+        role_envelopes = ctx.role_envelopes
+        combine = ctx.combine
+        combined = ctx.combined
 
-        # 每条轨道“处理前”的声音：素材 -> 效果链 -> 推子/声像，但不含任何闪避。
-        # 控制轨静音时仍然按位置/裁切/增益参与电平分析（沿用既有约定）。
-        raw_buses: dict[str, np.ndarray] = {}
-        needed = set()
-        for role in plan_copy["roles"]:
-            needed.update(role["control_track_ids"])
-            needed.update(role["target_track_ids"])
-        for track_id in needed:
-            track = next((item for item in project.tracks if item.id == track_id), None)
-            if track is not None:
-                raw_buses[track_id] = _render_track_bus(
-                    project, track, get_source, 0, envelope_frames, sr, 0, envelope_frames,
-                )
+        if candidate_override:
+            # 试听候选：只替换包络，不触碰工程与素材；
+            # 冲突区间保持当前方案，不任意选择关系。
+            from .planner import candidate_envelopes, compute_conflicts
+            combined = candidate_envelopes(
+                candidate_override, ctx, base=combined,
+                conflicts=compute_conflicts(ctx))
+        else:
+            # 已批准时间段：仅这些段使用候选包络，其余保持当前方案不变，
+            # 段边界做短交叉淡化保证逐采样连续。
+            from .planner import apply_approvals, compute_conflicts
+            combined = apply_approvals(
+                project.ducking.get("approvals", []), plan_v2["id"], ctx, combined,
+                conflicts=compute_conflicts(ctx))
 
-        combine = plan_copy["combine"]
-        # 已作用到各受控轨上的累计增益，与每个角色自己的包络；
-        # post 角色听到的是 raw * 此前累计增益，pre 角色只听 raw。
-        combined: dict[str, np.ndarray] = {}
-        role_envelopes: dict[str, np.ndarray] = {}
-        priorities = {rid: int(roles_by_id[rid]["priority"]) for rid in role_order}
-        for rid in role_order:
-            role = roles_by_id[rid]
-            # 同一角色的多条控制轨取电平最大值；轨 id 已去重，不会多压一次。
-            levels = []
-            for cid in role["control_track_ids"]:
-                if cid not in raw_buses:
-                    continue
-                raw = raw_buses[cid]
-                if role["source"] == "post" and cid in combined:
-                    # 明确使用“处理后”的声音：乘上此前已作用到该轨的闪避增益。
-                    raw = raw * combined[cid][:, None]
-                levels.append(np.max(np.abs(raw), axis=1))
-            if levels:
-                control_level = np.maximum.reduce(levels)
-                control_bus = control_level[:, None] * np.ones((1, channels))
-            else:
-                control_bus = np.zeros((envelope_frames, channels))
-            envelope = _ducking_gain_envelope(control_bus, role, sr)
-            role_envelopes[rid] = envelope
-            for target_id in role["target_track_ids"]:
-                if target_id not in raw_buses:
-                    continue
-                current = combined.get(target_id)
-                if current is None:
-                    combined[target_id] = envelope.copy()
-                elif combine == "multiply":
-                    # 明确的共同作用规则：线性增益相乘（dB 压低量相加）。
-                    combined[target_id] = current * envelope
-                else:
-                    # 由较强（压得更深）的一方逐采样主导；交接因此连续。
-                    combined[target_id] = np.minimum(current, envelope)
         duck_envelopes = {tid: gain for tid, gain in combined.items()}
 
         # 每个受控轨在每个采样点的“当前控制者”编号，用于来源分段报告。
         owner_ids: dict[str, np.ndarray] = {}
         target_roles: dict[str, list[str]] = {}
+        priorities = {rid: int(roles_by_id[rid]["priority"]) for rid in role_order}
         for rid in role_order:
             for tid in roles_by_id[rid]["target_track_ids"]:
                 target_roles.setdefault(tid, []).append(rid)

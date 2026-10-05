@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api } from "../api";
 import { useStudio } from "../store";
-import type { DuckingConfig, DuckingConfigV2, PreviewReport } from "../types";
+import type { DuckingConfig, DuckingConfigV2, PlannerResult, PreviewReport } from "../types";
 import {
   type DuckingSnapshot, type RangeFilters, emptyFilters,
   flattenRanges, filterRanges, roleOptions, roleLabel, deletedRoles,
@@ -173,7 +173,170 @@ function RoleCard({ role, tracks }: {
         <label>恢复 {role.release_sec.toFixed(2)}s
           <input type="number" min={0} max={30} step={0.01} value={role.release_sec}
             onChange={(e) => updateRole(role.id, { release_sec: Number(e.target.value) })} /></label>
+        <label>可听度下限 {role.floor_db === null || role.floor_db === undefined ? "不约束" : `${role.floor_db.toFixed(0)} dB`}
+          <input type="number" min={-60} max={0} step={1}
+            value={role.floor_db ?? ""}
+            placeholder="不约束"
+            onChange={(e) => updateRole(role.id, {
+              floor_db: e.target.value === "" ? null : Number(e.target.value),
+            })} /></label>
+        <label>允许恢复时长 {role.max_recovery_sec === null || role.max_recovery_sec === undefined ? "不约束" : `${role.max_recovery_sec.toFixed(2)}s`}
+          <input type="number" min={0.01} max={30} step={0.01}
+            value={role.max_recovery_sec ?? ""}
+            placeholder="不约束"
+            onChange={(e) => updateRole(role.id, {
+              max_recovery_sec: e.target.value === "" ? null : Number(e.target.value),
+            })} /></label>
       </div>
+    </div>
+  );
+}
+
+function PlannerSection({ plan }: { plan: DuckingConfigV2["plans"][number] }) {
+  const { project, addDuckingApproval, clearDuckingApprovals } = useStudio();
+  const [result, setResult] = useState<PlannerResult | null>(null);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [auditionId, setAuditionId] = useState("");
+  const ducking = project.ducking as DuckingConfigV2;
+  const approvals = ducking.approvals ?? [];
+  const trackName = (id: string) => project.tracks.find((t) => t.id === id)?.name ?? id;
+  const roleName = (id: string) => plan.roles.find((r) => r.id === id)?.name ?? id;
+
+  async function generate() {
+    setBusy(true);
+    setMessage("正在生成候选包络方案……");
+    try {
+      const next = await api.planDucking(useStudio.getState().project);
+      setResult(next);
+      setMessage(next.conflicts.length
+        ? `生成完成：${next.candidates.length} 个候选，${next.conflicts.length} 处冲突需人工处理`
+        : `生成完成：${next.candidates.length} 个可比较候选，无冲突`);
+    } catch (error) {
+      setMessage((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function audition(candidateId: string) {
+    setBusy(true);
+    try {
+      // 试听只读：候选与原混音两份预览对照，工程保持不变。
+      const outcome = await api.auditionDucking(useStudio.getState().project, candidateId);
+      setAuditionId(candidateId);
+      const fmt = (peak: number) => (20 * Math.log10(Math.max(peak, 1e-9))).toFixed(1);
+      setMessage(`试听 ${candidateId}：候选峰值 ${fmt(outcome.preview.peak)} dBFS，` +
+        `原混音峰值 ${fmt(outcome.original.peak)} dBFS（工程未修改）`);
+    } catch (error) {
+      setMessage((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function approve(candidateId: string, targetId: string, start: number, end: number) {
+    addDuckingApproval({ plan_id: plan.id, candidate: candidateId, target_id: targetId, start, end });
+    setMessage(`已批准 ${candidateId} 在 ${trackName(targetId)} 的 ${start.toFixed(2)}–${end.toFixed(2)}s 段；` +
+      "其余时间段保持当前方案不变");
+  }
+
+  return (
+    <div className="duck-planner">
+      <div className="ducking-title">
+        <strong>压低方案规划（交错角色）</strong>
+        <span>根据重叠交接区间生成可比较的候选包络；冲突只明示不自动选择；
+          试听保留原混音，可按时间段批准，边界连续、未批准段不变。</span>
+      </div>
+      <div className="duck-actions">
+        <button type="button" disabled={busy} onClick={generate}>生成候选包络方案</button>
+        {approvals.length > 0 && (
+          <button type="button" onClick={() => { clearDuckingApprovals(); setMessage("已清除全部批准时间段"); }}>
+            清除全部批准（{approvals.length}）
+          </button>
+        )}
+        <span className={result?.conflicts.length ? "duck-error-text" : ""}>{message}</span>
+      </div>
+      {result && result.conflicts.length > 0 && (
+        <div className="duck-message duck-error-text">
+          {result.conflicts.map((conflict, i) => (
+            <div key={i}>[{conflict.type === "ring" ? "环形控制" : "可听度冲突"}] {conflict.message}</div>
+          ))}
+        </div>
+      )}
+      {result && result.candidates.length > 0 && (
+        <div className="duck-ranges-table-wrap">
+          <table className="duck-ranges-table">
+            <thead>
+              <tr>
+                <th>候选方案</th><th>受控轨</th><th>实际峰值</th><th>最深增益</th>
+                <th>恢复时刻</th><th>恢复约束</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {result.candidates.flatMap((candidate) =>
+                candidate.targets.map((target) => (
+                  <tr key={`${candidate.id}-${target.target_id}`}
+                    className={auditionId === candidate.id ? "duck-mode-active" : ""}>
+                    <td>{candidate.name}</td>
+                    <td>{trackName(target.target_id)}</td>
+                    <td>{(20 * Math.log10(Math.max(target.peak, 1e-9))).toFixed(1)} dBFS</td>
+                    <td>{target.min_gain_db.toFixed(1)} dB</td>
+                    <td>{target.recoveries.length === 0 ? "—" : target.recoveries
+                      .map((r) => `${r.after.toFixed(2)}s→${r.recovered_at === null ? "未恢复" : r.recovered_at.toFixed(2) + "s"}`)
+                      .join("；")}</td>
+                    <td>{target.max_recovery_sec === null ? "不约束"
+                      : target.recovery_ok ? `≤${target.max_recovery_sec}s ✓` : `超过 ${target.max_recovery_sec}s 限制`}</td>
+                    <td>
+                      <button type="button" disabled={busy}
+                        onClick={() => audition(candidate.id)}>试听</button>
+                    </td>
+                  </tr>
+                )))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {result && result.segments.length > 0 && auditionId && (
+        <div className="duck-ranges-table-wrap">
+          <strong>按时间段批准（{result.segments.length} 个交接区间，当前试听：{auditionId}）</strong>
+          <table className="duck-ranges-table">
+            <thead>
+              <tr><th>起始(s)</th><th>结束(s)</th><th>受控轨</th><th>活动角色</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              {result.segments.map((seg, i) => {
+                const approved = approvals.some((a) => a.candidate === auditionId &&
+                  a.target_id === seg.target_id &&
+                  Math.abs(a.start - seg.start) < 1e-6 && Math.abs(a.end - seg.end) < 1e-6);
+                return (
+                  <tr key={`${seg.target_id}-${seg.start}-${i}`}>
+                    <td>{seg.start.toFixed(3)}</td>
+                    <td>{seg.end.toFixed(3)}</td>
+                    <td>{trackName(seg.target_id)}</td>
+                    <td>{seg.active_roles.map(roleName).join(" + ")}{seg.overlap ? "（交叠）" : ""}</td>
+                    <td>{approved ? "已批准" : (
+                      <button type="button"
+                        onClick={() => approve(auditionId, seg.target_id, seg.start, seg.end)}>
+                        批准此段
+                      </button>
+                    )}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {approvals.length > 0 && (
+        <div className="duck-message">
+          已批准 {approvals.length} 段：
+          {approvals.map((a, i) => (
+            <span key={i}> {a.candidate}@{trackName(a.target_id)} {a.start.toFixed(2)}–{a.end.toFixed(2)}s；</span>
+          ))}
+          其余时间段保持当前方案不变。
+        </div>
+      )}
     </div>
   );
 }
@@ -374,6 +537,8 @@ export function DuckingPanel() {
         <button type="button" disabled={busy} onClick={analyze}>检测混音 / 核对来源交接</button>
         <span className={message.includes("环") || message.includes("重复") ? "duck-error-text" : ""}>{message}</span>
       </div>
+
+      <PlannerSection plan={plan} />
 
       {snapshots.length > 0 && (
         <div className="duck-snapshots">

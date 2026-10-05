@@ -67,6 +67,10 @@ export interface DuckingRole {
   attack_sec: number;
   hold_sec: number;
   release_sec: number;
+  /** 可听度下限（dB）：该角色控制期间受控轨不允许被压到它之下；null = 不约束。 */
+  floor_db?: number | null;
+  /** 允许的恢复时长（秒）：停声后受控轨须在此时间内恢复；null = 不约束。 */
+  max_recovery_sec?: number | null;
 }
 
 export interface DuckingPlan {
@@ -81,6 +85,61 @@ export interface DuckingConfigV2 {
   version: 2;
   active_plan_id: string;
   plans: DuckingPlan[];
+  /** 已批准的候选包络时间段；未批准段保持当前方案不变。 */
+  approvals?: DuckingApproval[];
+}
+
+export interface DuckingApproval {
+  plan_id: string;
+  candidate: string;
+  target_id: string;
+  start: number;
+  end: number;
+}
+
+export interface PlannerSegment {
+  target_id: string;
+  start: number;
+  end: number;
+  active_roles: string[];
+  overlap: boolean;
+}
+
+export interface PlannerRecovery {
+  after: number;
+  recovered_at: number | null;
+  duration: number;
+}
+
+export interface PlannerCandidateTarget {
+  target_id: string;
+  peak: number;
+  min_gain_db: number;
+  recoveries: PlannerRecovery[];
+  max_recovery_sec: number | null;
+  recovery_ok: boolean | null;
+}
+
+export interface PlannerCandidate {
+  id: string;
+  name: string;
+  targets: PlannerCandidateTarget[];
+}
+
+export interface PlannerConflict {
+  type: "audibility" | "ring";
+  target_id?: string;
+  start?: number;
+  end?: number;
+  roles?: string[];
+  message: string;
+}
+
+export interface PlannerResult {
+  plan_id: string;
+  segments: PlannerSegment[];
+  candidates: PlannerCandidate[];
+  conflicts: PlannerConflict[];
 }
 
 export interface DuckingTargetReport {

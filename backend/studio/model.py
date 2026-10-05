@@ -373,6 +373,17 @@ _ROLE_PARAM_LIMITS = {
     "release_sec": (0.0, 30.0),
 }
 
+# 可选的规划约束（不设置时为 None，不参与规划）。
+_ROLE_OPTIONAL_LIMITS = {
+    # 可听度下限：该角色控制期间，受控轨增益不允许被压到它之下。
+    "floor_db": (-60.0, 0.0),
+    # 允许的恢复时长：角色停声后受控轨须在此时间内恢复满电平。
+    "max_recovery_sec": (0.01, 30.0),
+}
+
+# 规划器可生成的候选包络方案 id（见 planner.py）。
+CANDIDATE_IDS = ("deep_first", "priority_first", "floor_limited", "recovery_fit")
+
 
 def default_role(role_id: str = "host", name: str = "主持人",
                  depth_db: float = -12.0) -> dict[str, Any]:
@@ -391,6 +402,9 @@ def default_role(role_id: str = "host", name: str = "主持人",
         "attack_sec": 0.05,
         "hold_sec": 0.15,
         "release_sec": 0.60,
+        # 规划约束：可听度下限 / 允许的恢复时长；None 表示不约束。
+        "floor_db": None,
+        "max_recovery_sec": None,
     }
 
 
@@ -413,6 +427,9 @@ def default_ducking_v2() -> dict[str, Any]:
         "version": 2,
         "active_plan_id": "plan1",
         "plans": [plan],
+        # 已批准的候选包络时间段：{plan_id, candidate, target_id, start, end}。
+        # 未批准的时间段保持当前方案不变。
+        "approvals": [],
     }
 
 
@@ -434,6 +451,9 @@ def _normalize_role(data: Any) -> dict[str, Any]:
         if key in _ROLE_PARAM_LIMITS:
             low, high = _ROLE_PARAM_LIMITS[key]
             role[key] = min(high, max(low, float(value)))
+    for key, (low, high) in _ROLE_OPTIONAL_LIMITS.items():
+        value = role.get(key)
+        role[key] = None if value is None else min(high, max(low, float(value)))
     controls = role.get("control_track_ids", [])
     targets = role.get("target_track_ids", [])
     if not isinstance(controls, list) or not isinstance(targets, list):
@@ -549,8 +569,39 @@ def _ducking_v2_from_dict(data: dict[str, Any]) -> dict[str, Any]:
         "version": 2,
         "active_plan_id": active_id,
         "plans": plans,
+        "approvals": _approvals_from_dict(data.get("approvals"), plan_ids=set(plan_ids)),
     }
     return config
+
+
+def _approvals_from_dict(data: Any, plan_ids: set[str]) -> list[dict[str, Any]]:
+    """归一化已批准时间段；非法条目直接报错而不是静默丢弃。"""
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise ValueError("已批准时间段必须是列表")
+    approvals: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            raise ValueError("已批准时间段必须是对象")
+        candidate = str(item.get("candidate", ""))
+        if candidate not in CANDIDATE_IDS:
+            raise ValueError(f"未知候选包络方案: {candidate!r}")
+        plan_id = str(item.get("plan_id", ""))
+        if plan_id not in plan_ids:
+            raise ValueError(f"已批准时间段引用了不存在的方案 {plan_id}")
+        start = float(item.get("start", 0.0))
+        end = float(item.get("end", 0.0))
+        if not end > start >= 0.0:
+            raise ValueError("已批准时间段的起止时间非法")
+        approvals.append({
+            "plan_id": plan_id,
+            "candidate": candidate,
+            "target_id": str(item.get("target_id", "")),
+            "start": start,
+            "end": end,
+        })
+    return approvals
 
 
 def active_ducking_plan_v2(ducking: dict[str, Any]) -> dict[str, Any] | None:

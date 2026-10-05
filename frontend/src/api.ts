@@ -1,4 +1,4 @@
-import type { DuckingConfig, DuckingConfigV2, MediaInfo, PreviewReport, ProjectData } from "./types";
+import type { DuckingConfig, DuckingConfigV2, MediaInfo, PlannerResult, PreviewReport, ProjectData } from "./types";
 
 async function request(path: string, options?: RequestInit): Promise<unknown> {
   const response = await fetch(path, {
@@ -32,6 +32,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify(project),
     }) as Promise<PreviewReport>,
+  planDucking: (project: ProjectData) =>
+    request("/api/ducking/plan", {
+      method: "POST",
+      body: JSON.stringify(project),
+    }) as Promise<PlannerResult>,
+  auditionDucking: (project: ProjectData, candidate: string) =>
+    request("/api/ducking/audition", {
+      method: "POST",
+      body: JSON.stringify({ project, candidate }),
+    }) as Promise<{ candidate: string; original: PreviewReport; preview: PreviewReport }>,
   startExport: (outputPath: string, allowOverRange: boolean,
     range?: { start_time?: number; end_time?: number; include_tail?: boolean }) =>
     request("/api/export", {
@@ -80,13 +90,17 @@ export function defaultDuckingV2(): DuckingConfigV2 {
       combine: "strongest",
       roles: [
         { id: "host", name: "主持人", priority: 10, control_track_ids: [], target_track_ids: [],
-          source: "pre", threshold_db: -25, depth_db: -12, attack_sec: 0.05, hold_sec: 0.15, release_sec: 0.6 },
+          source: "pre", threshold_db: -25, depth_db: -12, attack_sec: 0.05, hold_sec: 0.15, release_sec: 0.6,
+          floor_db: null, max_recovery_sec: null },
         { id: "guest", name: "远端嘉宾", priority: 8, control_track_ids: [], target_track_ids: [],
-          source: "pre", threshold_db: -25, depth_db: -9, attack_sec: 0.05, hold_sec: 0.15, release_sec: 0.6 },
+          source: "pre", threshold_db: -25, depth_db: -9, attack_sec: 0.05, hold_sec: 0.15, release_sec: 0.6,
+          floor_db: null, max_recovery_sec: null },
         { id: "beep", name: "提示音", priority: 6, control_track_ids: [], target_track_ids: [],
-          source: "pre", threshold_db: -25, depth_db: -15, attack_sec: 0.02, hold_sec: 0.08, release_sec: 0.4 },
+          source: "pre", threshold_db: -25, depth_db: -15, attack_sec: 0.02, hold_sec: 0.08, release_sec: 0.4,
+          floor_db: null, max_recovery_sec: null },
       ],
     }],
+    approvals: [],
   };
 }
 
